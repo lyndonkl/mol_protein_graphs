@@ -6,3 +6,4 @@
 
 # Allow Jupyter notebooks
 !*.ipynb
+!*.py
