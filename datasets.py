@@ -152,10 +152,10 @@ class MoleculeDataset(Dataset):
             data.edge_types = set(bond_edges.keys())
     
             return data
-    except ValueError as e:
-        # Ignore molecule if embedding failed
-        print(f"Skipping molecule at index {idx} due to error: {e}")
-        return None
+        except ValueError as e:
+            # Ignore molecule if embedding failed
+            print(f"Skipping molecule at index {idx} due to error: {e}")
+            return None
 
     @staticmethod
     def get_atom_features(atom):
