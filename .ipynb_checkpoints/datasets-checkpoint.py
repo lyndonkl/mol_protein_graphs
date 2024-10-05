@@ -40,6 +40,11 @@ class MoleculeDataset(Dataset):
             data['invalid'] = True  # Skip invalid SMILES
             data['dummy_node'].x = torch.zeros((1, 1), dtype=torch.float)  # Dummy node feature
             data['dummy_node'].y = torch.tensor([0], dtype=torch.float)  # Dummy label
+            data['dummy_node', 'to', 'dummy_node'].edge_index = torch.tensor([[0], [0]], dtype=torch.long)  # Self-loop edge
+            data['dummy_node', 'to', 'dummy_node'].edge_attr = torch.zeros((1, 1), dtype=torch.float)  # Dummy edge attribute
+            
+            # Update node and edge types
+            data.edge_types = [('dummy_node', 'to', 'dummy_node')]
             data.node_types = ['dummy_node'] 
             return data
 
@@ -84,6 +89,11 @@ class MoleculeDataset(Dataset):
             data['invalid'] = True
             data['dummy_node'].x = torch.zeros((1, 1), dtype=torch.float)  # Dummy node feature
             data['dummy_node'].y = torch.tensor([0], dtype=torch.float)  # Dummy label
+            data['dummy_node', 'to', 'dummy_node'].edge_index = torch.tensor([[0], [0]], dtype=torch.long)  # Self-loop edge
+            data['dummy_node', 'to', 'dummy_node'].edge_attr = torch.zeros((1, 1), dtype=torch.float)  # Dummy edge attribute
+            
+            # Update node and edge types
+            data.edge_types = [('dummy_node', 'to', 'dummy_node')]
             data.node_types = ['dummy_node'] 
             return data
 
