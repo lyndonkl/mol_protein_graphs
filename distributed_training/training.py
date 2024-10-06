@@ -4,19 +4,20 @@ import random
 import json
 
 # Third-party imports
+# Standard library imports
+import warnings
+
+# Third-party imports
 import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch_geometric.loader import HGTLoader
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from torch.nn.parallel import DistributedDataParallel
-import warnings
-
-# At the beginning of your script
-warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
@@ -33,82 +34,70 @@ random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
+# Ignore all warnings
+warnings.filterwarnings("ignore")
+
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
         self.rank = rank
         self.world_size = world_size
         self.criterion = criterion
         self.optimizer = optimizer
+        self.model = model
 
-        # Combine molecule and protein node types
-        molecule_node_types = graph_metadata['molecule_node_types']
-        protein_node_types = graph_metadata['protein_node_types']
-        all_node_types = molecule_node_types + protein_node_types
+        # Create a DistributedSampler for the training data
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
 
-        # Create input_nodes dictionary for training
-        train_size = len(train_dataset)
-        indices = torch.arange(train_size)
-        split = train_size // world_size
-        start_idx = rank * split
-        end_idx = start_idx + split if rank != (world_size - 1) else train_size
-        train_indices = indices[start_idx:end_idx]
-        train_input_nodes = {node_type: train_indices for node_type in all_node_types}
-
-        # Create num_samples dictionary
-        num_samples = {node_type: [10, 5] for node_type in all_node_types}
-
-        self.train_loader = HGTLoader(
+        self.train_loader = DataLoader(
             train_dataset,
-            num_samples=num_samples,
-            input_nodes=train_input_nodes,
             batch_size=64,
             num_workers=4,
-            shuffle=True,
-            transform=custom_transform
+            shuffle=False,  # DistributedSampler handles shuffling
+            sampler=train_sampler,
+            collate_fn=collate_fn
         )
 
-        # Perform a dummy forward pass to initialize lazy modules and avoid
-        # "RuntimeError: Tensors must be CUDA and dense" when using DistributedDataParallel
+        # Perform a dummy forward pass to initialize lazy modules
         dummy_batch = next(iter(self.train_loader))
-        dummy_mol_data, dummy_prot_data = dummy_batch['mol_batch'], dummy_batch['prot_batch']
-        dummy_mol_data = dummy_mol_data.to(rank)
-        dummy_prot_data = dummy_prot_data.to(rank)
+        dummy_mol_data, dummy_prot_data, _ = dummy_batch
+        dummy_mol_data = dummy_mol_data.to(self.rank)
+        dummy_prot_data = dummy_prot_data.to(self.rank)
+
+        # Ensure model is on the correct device before performing the dummy forward pass
+        self.model = self.model.to(self.rank)
+        
+        # Run the dummy forward pass
         with torch.no_grad():
-            self.model(dummy_mol_data, dummy_prot_data)
+            _ = self.model(dummy_mol_data, dummy_prot_data)
 
         # Wrap the model with DistributedDataParallel
-        self.model = DistributedDataParallel(self.model, device_ids=[rank])
+        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank)
 
         if rank == 0:
-            val_input_nodes = {node_type: None for node_type in all_node_types}
-            self.val_loader = HGTLoader(
+            self.val_loader = DataLoader(
                 val_dataset,
-                num_samples=num_samples,
-                input_nodes=val_input_nodes,
                 batch_size=64,
                 num_workers=4,
                 shuffle=False,
-                transform=custom_transform
+                collate_fn=collate_fn
             )
             
-            self.test_loader = HGTLoader(
+            self.test_loader = DataLoader(
                 test_dataset,
-                num_samples=num_samples,
-                input_nodes=val_input_nodes,
                 batch_size=64,
                 num_workers=4,
                 shuffle=False,
-                transform=custom_transform
+                collate_fn=collate_fn
             )
 
-    def train_epoch(self):
+    def train_epoch(self, epoch):
+        # Set the epoch for the DistributedSampler
+        self.train_loader.sampler.set_epoch(epoch)
+
         self.model.train()
         total_loss = torch.zeros(2).to(self.rank)
-        for batch in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
+        for mol_data, prot_data, batch_size in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
             self.optimizer.zero_grad()
-            mol_data = batch['mol_batch'].to(self.rank)
-            prot_data = batch['prot_batch'].to(self.rank)
-            batch_size = batch['batch_size']
             out = self.model(mol_data, prot_data)
             
             out = out[:batch_size]
@@ -171,7 +160,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     logger = setup_logger() if rank == 0 else None
 
     # Initialize model, criterion, and optimizer
-    model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4).to(rank)
+    model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -181,7 +170,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     num_epochs = 5  # Set your number of epochs
     best_val_loss = float('inf')
     for epoch in range(num_epochs):
-        train_loss = trainer.train_epoch()
+        train_loss = trainer.train_epoch(epoch)
 
         # Add barrier to synchronize all processes
         torch.distributed.barrier()

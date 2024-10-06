@@ -191,10 +191,11 @@ class MoleculeDataset(Dataset):
 
 
 class CombinedDataset(Dataset):
-    def __init__(self, dataframe, protein_graphs, transform=None, pre_transform=None, cache_dir='./processed'):
+    def __init__(self, dataframe, protein_graphs, transform=None, pre_transform=None, cache_dir='./processed', graph_metadata=None):
         self.dataframe = dataframe.reset_index(drop=True)
         self.protein_graphs = protein_graphs
         self.cache_dir = cache_dir
+        self.graph_metadata = graph_metadata
         os.makedirs(self.cache_dir, exist_ok=True)
         super(CombinedDataset, self).__init__(None, transform, pre_transform)
 
