@@ -1,10 +1,11 @@
 # Standard library imports
 
 # Third-party imports
+import numpy as np
 import torch
-from torch_geometric.data import HeteroData
 from Bio.PDB import PDBParser, is_aa
 from Bio.PDB.Polypeptide import three_to_index, index_to_one
+from torch_geometric.data import HeteroData
 
 class ProteinProcessor:
     @staticmethod
