@@ -41,7 +41,7 @@ class CrossAttentionLayer(torch.nn.Module):
         return out
 
 class CrossGraphAttentionModel(torch.nn.Module):
-    def __init__(self, hidden_dim: int = 64, num_attention_heads: int = 4, graph_metadata = {}):
+    def __init__(self, graph_metadata, hidden_dim: int = 64, num_attention_heads: int = 4):
         super(CrossGraphAttentionModel, self).__init__()
 
         self.molecule_node_types = graph_metadata['molecule_node_types']

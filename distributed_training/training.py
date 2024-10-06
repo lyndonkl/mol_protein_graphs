@@ -9,9 +9,14 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch_geometric.loader import HGTLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from torch.nn.parallel import DistributedDataParallel
+import warnings
+
+# At the beginning of your script
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
 
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
@@ -30,7 +35,6 @@ torch.manual_seed(RANDOM_SEED)
 
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
-        self.model = DistributedDataParallel(model.to(rank), device_ids=[rank])
         self.rank = rank
         self.world_size = world_size
         self.criterion = criterion
@@ -63,6 +67,17 @@ class Trainer:
             transform=custom_transform
         )
 
+        # Perform a dummy forward pass
+        dummy_batch = next(iter(self.train_loader))
+        dummy_mol_data, dummy_prot_data = dummy_batch
+        dummy_mol_data = dummy_mol_data.to(rank)
+        dummy_prot_data = dummy_prot_data.to(rank)
+        with torch.no_grad():
+            self.model(dummy_mol_data, dummy_prot_data)
+
+        # Wrap the model with DistributedDataParallel
+        self.model = DistributedDataParallel(self.model, device_ids=[rank])
+
         if rank == 0:
             val_input_nodes = {node_type: None for node_type in all_node_types}
             self.val_loader = HGTLoader(
@@ -74,6 +89,7 @@ class Trainer:
                 shuffle=False,
                 transform=custom_transform
             )
+            
             self.test_loader = HGTLoader(
                 test_dataset,
                 num_samples=num_samples,
@@ -154,7 +170,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     logger = setup_logger() if rank == 0 else None
 
     # Initialize model, criterion, and optimizer
-    model = DistributedDataParallel(CrossGraphAttentionModel(hidden_dim=64, num_attention_heads=4, graph_metadata=graph_metadata).to(rank), device_ids=[rank])
+    model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4).to(rank)
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
