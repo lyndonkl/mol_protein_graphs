@@ -19,6 +19,15 @@ def collate_fn(batch):
 
     return mol_batch, prot_batch, batch_size
 
+def collect_protein_node_and_edge_types(protein_graphs):
+    protein_node_types = set()
+    protein_edge_types = set()
+    for protein_data in protein_graphs.values():
+        protein_node_types.update(protein_data.node_types)
+        protein_edge_types.update(protein_data.edge_types)
+        protein_edge_types.update(protein_data.reverse_edge_types)
+    return sorted(protein_node_types), sorted(protein_edge_types)
+
 def setup_logger():
     logger = logging.getLogger('TrainingLogger')
     logger.setLevel(logging.INFO)

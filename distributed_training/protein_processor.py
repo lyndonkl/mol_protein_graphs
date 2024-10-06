@@ -1,3 +1,9 @@
+import torch
+from torch_geometric.data import Dataset, HeteroData, Batch
+from Bio.PDB import PDBParser, is_aa
+from Bio.PDB.Polypeptide import three_to_index, index_to_one
+import numpy as np
+
 class ProteinProcessor:
     @staticmethod
     def residue_name_to_idx(res_name_one):

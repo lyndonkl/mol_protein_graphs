@@ -1,3 +1,11 @@
+import torch
+import torch.nn.functional as F
+from torch.nn import Linear
+from torch_geometric.loader import HGTLoader
+from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool
+from torch.utils.data import random_split
+from torch_geometric.data import HeteroData
+
 class CrossAttentionLayer(torch.nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int = 4):
         super(CrossAttentionLayer, self).__init__()
@@ -27,27 +35,32 @@ class CrossAttentionLayer(torch.nn.Module):
         return out
 
 class CrossGraphAttentionModel(torch.nn.Module):
-    def __init__(self, hidden_dim: int = 64, num_attention_heads: int = 4):
+    def __init__(self, hidden_dim: int = 64, num_attention_heads: int = 4, graph_metadata = {}):
         super(CrossGraphAttentionModel, self).__init__()
+
+        self.molecule_node_types = graph_metadata['molecule_node_types']
+        self.protein_node_types = graph_metadata['protein_node_types']
+        self.molecule_edge_types = graph_metadata['molecule_edge_types']
+        self.protein_edge_types = graph_metadata['protein_edge_types']
 
         self.mol_conv1 = HeteroConv({
             edge_type: SAGEConv((-1, -1), hidden_dim)
-            for edge_type in molecule_edge_types
+            for edge_type in self.molecule_edge_types
         }, aggr='mean')
 
         self.mol_conv2 = HeteroConv({
             edge_type: SAGEConv((-1, -1), hidden_dim)
-            for edge_type in molecule_edge_types
+            for edge_type in self.molecule_edge_types
         }, aggr='mean')
 
         self.prot_conv1 = HeteroConv({
             edge_type: SAGEConv((-1, -1), hidden_dim)
-            for edge_type in protein_edge_types
+            for edge_type in self.protein_edge_types
         }, aggr='mean')
 
         self.prot_conv2 = HeteroConv({
             edge_type: SAGEConv((-1, -1), hidden_dim)
-            for edge_type in protein_edge_types
+            for edge_type in self.protein_edge_types
         }, aggr='mean')
 
         self.cross_attn_mol_to_prot = CrossAttentionLayer(hidden_dim, num_attention_heads)
@@ -63,7 +76,7 @@ class CrossGraphAttentionModel(torch.nn.Module):
         x_mol_dict = {key: F.relu(x) for key, x in self.mol_conv1(x_mol_dict, edge_index_mol_dict).items()}
         x_mol_dict = {key: F.relu(x) for key, x in self.mol_conv2(x_mol_dict, edge_index_mol_dict).items()}
 
-        H_mol = torch.cat([x_mol_dict[nt] for nt in molecule_node_types if nt in x_mol_dict], dim=0)
+        H_mol = torch.cat([x_mol_dict[nt] for nt in self.molecule_node_types if nt in x_mol_dict], dim=0)
 
         x_prot_dict = prot_data.x_dict
         edge_index_prot_dict = prot_data.edge_index_dict
@@ -71,7 +84,7 @@ class CrossGraphAttentionModel(torch.nn.Module):
         x_prot_dict = {key: F.relu(x) for key, x in self.prot_conv1(x_prot_dict, edge_index_prot_dict).items()}
         x_prot_dict = {key: F.relu(x) for key, x in self.prot_conv2(x_prot_dict, edge_index_prot_dict).items()}
 
-        H_prot = torch.cat([x_prot_dict[nt] for nt in protein_node_types if nt in x_prot_dict], dim=0)
+        H_prot = torch.cat([x_prot_dict[nt] for nt in self.protein_node_types if nt in x_prot_dict], dim=0)
 
         H_mol_attn = self.cross_attn_mol_to_prot(H_mol, H_prot)
         H_prot_attn = self.cross_attn_prot_to_mol(H_prot, H_mol)
@@ -79,8 +92,8 @@ class CrossGraphAttentionModel(torch.nn.Module):
         H_mol_combined = H_mol + H_mol_attn
         H_prot_combined = H_prot + H_prot_attn
 
-        mol_batches = torch.cat([mol_data.batch_dict[nt] for nt in molecule_node_types if nt in mol_data.batch_dict])
-        prot_batches = torch.cat([prot_data.batch_dict[nt] for nt in protein_node_types if nt in prot_data.batch_dict])
+        mol_batches = torch.cat([mol_data.batch_dict[nt] for nt in self.molecule_node_types if nt in mol_data.batch_dict])
+        prot_batches = torch.cat([prot_data.batch_dict[nt] for nt in self.protein_node_types if nt in prot_data.batch_dict])
 
         z_mol = global_mean_pool(H_mol_combined, mol_batches)
         z_prot = global_mean_pool(H_prot_combined, prot_batches)

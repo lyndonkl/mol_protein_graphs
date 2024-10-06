@@ -8,29 +8,21 @@ from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from torch.nn import Linear
-from torch_geometric.data import Dataset, HeteroData, Batch
-from torch_geometric.loader import HGTLoader
-from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool
-from torch.nn.parallel import DistributedDataParallel
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.utils.data import random_split
 from rdkit import Chem
 from rdkit.Chem import AllChem
-from Bio.PDB import PDBParser, is_aa
-from Bio.PDB.Polypeptide import three_to_index, index_to_one
 from sklearn.model_selection import train_test_split
 import logging
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from tqdm import tqdm
+from torch.nn.parallel import DistributedDataParallel
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
 from protein_processor import ProteinProcessor
 from model import CrossAttentionLayer, CrossGraphAttentionModel
-from utils import custom_transform, collate_fn, setup_logger
+from utils import custom_transform, collate_fn, setup_logger, collect_protein_node_and_edge_types
 
 # Constants
 RANDOM_SEED = 42
@@ -42,7 +34,7 @@ np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
 class Trainer:
-    def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size):
+    def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
         self.model = DDP(model.to(rank), device_ids=[rank])
         self.rank = rank
         self.world_size = world_size
@@ -50,6 +42,8 @@ class Trainer:
         self.optimizer = optimizer
 
         # Combine molecule and protein node types
+        molecule_node_types = graph_metadata['molecule_node_types']
+        protein_node_types = graph_metadata['protein_node_types']
         all_node_types = molecule_node_types + protein_node_types
 
         # Create input_nodes dictionary for training
@@ -164,13 +158,12 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     logger = setup_logger() if rank == 0 else None
 
     # Initialize model, criterion, and optimizer
-    model = CrossGraphAttentionModel(hidden_dim=64, num_attention_heads=4).to(rank)
-    model = DistributedDataParallel(model, device_ids=[rank])
+    model = DistributedDataParallel(CrossGraphAttentionModel(hidden_dim=64, num_attention_heads=4, graph_metadata=graph_metadata).to(rank), device_ids=[rank])
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Train the model
-    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size)
+    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata)
 
     num_epochs = 5  # Set your number of epochs
     best_val_loss = float('inf')
@@ -237,7 +230,6 @@ def main():
     with open('unique_atom_and_edge_types.json', 'r') as f:
         unique_types = json.load(f)
 
-    molecule_node_types, molecule_edge_types, protein_node_types, protein_edge_types
     molecule_node_types = unique_types['molecule_node_types']
     molecule_edge_types = [tuple(edge) for edge in unique_types['molecule_edge_types']]
     protein_node_types, protein_edge_types = collect_protein_node_and_edge_types(protein_graphs)
