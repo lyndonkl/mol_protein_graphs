@@ -7,3 +7,5 @@
 # Allow Jupyter notebooks
 !*.ipynb
 !*.py
+!*.sh
+!*.md
