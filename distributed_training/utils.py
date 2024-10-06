@@ -1,4 +1,13 @@
+# Standard library imports
+import logging
+
+# Third-party imports
+from torch_geometric.data import Batch
+
 def custom_transform(batch):
+    """
+    Custom transform function to prepare batch data for model input.
+    """
     mol_batch, prot_batch, batch_size = collate_fn(batch)
     return {
         'mol_batch': mol_batch,
@@ -7,6 +16,9 @@ def custom_transform(batch):
     }
 
 def collate_fn(batch):
+    """
+    Collate function to process and combine batch items.
+    """
     valid_items = [item for item in batch if item is not None and item[0] is not None and item[0]['invalid'] is False]
     
     mol_batch = [item[0] for item in valid_items]
@@ -20,6 +32,9 @@ def collate_fn(batch):
     return mol_batch, prot_batch, batch_size
 
 def collect_protein_node_and_edge_types(protein_graphs):
+    """
+    Collect unique protein node and edge types from protein graphs.
+    """
     protein_node_types = set()
     protein_edge_types = set()
     for protein_data in protein_graphs.values():
@@ -29,6 +44,9 @@ def collect_protein_node_and_edge_types(protein_graphs):
     return sorted(protein_node_types), sorted(protein_edge_types)
 
 def setup_logger():
+    """
+    Set up and configure a logger for training.
+    """
     logger = logging.getLogger('TrainingLogger')
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()

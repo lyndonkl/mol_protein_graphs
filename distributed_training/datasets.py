@@ -1,17 +1,11 @@
-import os
-import numpy as np
+# Standard library imports
+
+# Third-party imports
 import pandas as pd
 import torch
 from torch_geometric.data import Dataset, HeteroData
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import HeteroConv, GCNConv, Linear, global_mean_pool
-from torch.utils.data import random_split
 from rdkit import Chem
 from rdkit.Chem import AllChem
-from Bio.PDB import PDBParser, is_aa
-from Bio.PDB.Polypeptide import three_to_index, index_to_one
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from tqdm import tqdm
 
 # Device configuration
@@ -37,7 +31,8 @@ class MoleculeDataset(Dataset):
         data['invalid'] = False
         
         if mol is None:
-            data['invalid'] = True  # Skip invalid SMILES
+            # Handle invalid SMILES
+            data['invalid'] = True
             data['dummy_node'].x = torch.zeros((1, 1), dtype=torch.float)  # Dummy node feature
             data['dummy_node'].y = torch.tensor([0], dtype=torch.float)  # Dummy label
             data['dummy_node', 'to', 'dummy_node'].edge_index = torch.tensor([[0], [0]], dtype=torch.long)  # Self-loop edge
@@ -48,6 +43,7 @@ class MoleculeDataset(Dataset):
             data.node_types = ['dummy_node'] 
             return data
 
+        # Remove Dysprosium atoms if present
         atoms_to_remove = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetSymbol() == 'Dy']
         mol = Chem.EditableMol(mol)
         for idx in sorted(atoms_to_remove, reverse=True):
@@ -55,22 +51,9 @@ class MoleculeDataset(Dataset):
         mol = mol.GetMol()
 
         mol = Chem.AddHs(mol)
-        # Embed molecule using ETKDG algorithm
-        # params = AllChem.ETKDGv3()
-        # params.randomSeed = 42
-        # embed_result = AllChem.EmbedMolecule(mol, params)
-        # if embed_result != 0:
-        #     # Embedding failed
-        #     print(f"Embedding failed for molecule at index {idx}: {smiles}")
-        #     return None
-
+        
+        # Embed molecule
         AllChem.EmbedMolecule(mol, randomSeed=42)
-
-        # # Optimize molecule geometry (optional)
-        # optimize_result = AllChem.UFFOptimizeMolecule(mol)
-        # if optimize_result != 0:
-        #     print(f"Optimization failed for molecule at index {idx}: {smiles}")
-        #     # You can choose to skip the molecule or proceed without optimization
 
         atom_types = [atom.GetSymbol() for atom in mol.GetAtoms()]
         unique_atom_types = list(set(atom_types))
@@ -86,6 +69,7 @@ class MoleculeDataset(Dataset):
             print(f"Skipping index {idx} due to error: {e}")
 
         if conformer is None:
+            # Handle invalid conformer
             data['invalid'] = True
             data['dummy_node'].x = torch.zeros((1, 1), dtype=torch.float)  # Dummy node feature
             data['dummy_node'].y = torch.tensor([0], dtype=torch.float)  # Dummy label
@@ -131,13 +115,11 @@ class MoleculeDataset(Dataset):
             
             # Define edge type in consistent order
             if atype_i <= atype_j:
-                # Define edge type
                 edge_type = (atype_i, 'bond', atype_j)
                 reverse_edge_type = (atype_j, 'bond', atype_i)
                 src_atype, tgt_atype = atype_i, atype_j
                 src_idx, tgt_idx = i, j
             else:
-                # Define edge type
                 edge_type = (atype_j, 'bond', atype_i)
                 reverse_edge_type = (atype_i, 'bond', atype_j)
                 src_atype, tgt_atype = atype_j, atype_i
@@ -170,7 +152,6 @@ class MoleculeDataset(Dataset):
             edge_attr = torch.tensor(attrs['edge_attr'], dtype=torch.float)
             data[edge_type].edge_index = edge_index
             data[edge_type].edge_attr = edge_attr
-            
 
         # Add binding label and metadata
         data['smolecule'].y = torch.tensor([binds], dtype=torch.float)

@@ -1,8 +1,10 @@
+# Standard library imports
+
+# Third-party imports
 import torch
-from torch_geometric.data import Dataset, HeteroData, Batch
+from torch_geometric.data import HeteroData
 from Bio.PDB import PDBParser, is_aa
 from Bio.PDB.Polypeptide import three_to_index, index_to_one
-import numpy as np
 
 class ProteinProcessor:
     @staticmethod
@@ -14,15 +16,19 @@ class ProteinProcessor:
 
     @staticmethod
     def process_protein(pdb_file: str, threshold: float = 5.0) -> HeteroData:
+        # Initialize PDB parser and load structure
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure('protein', pdb_file)
 
+        # Extract amino acids and their types
         amino_acids = [residue for model in structure for chain in model for residue in chain if is_aa(residue)]
         amino_acid_types = [index_to_one(three_to_index(residue.get_resname())) for residue in amino_acids]
         unique_amino_acids = list(set(amino_acid_types))
 
+        # Initialize HeteroData object
         data = HeteroData()
 
+        # Prepare node features and positions
         node_features = {aa_type: [] for aa_type in unique_amino_acids}
         node_positions = {aa_type: [] for aa_type in unique_amino_acids}
 
@@ -34,14 +40,17 @@ class ProteinProcessor:
             node_features[aa_type].append([ProteinProcessor.residue_name_to_idx(aa_type)])
             node_positions[aa_type].append(pos)
 
+        # Add node features and positions to HeteroData object
         for aa_type in unique_amino_acids:
             data[aa_type].x = torch.tensor(node_features[aa_type], dtype=torch.float)
             data[aa_type].pos = torch.tensor(np.array(node_positions[aa_type]), dtype=torch.float)
 
+        # Initialize edge data structures
         contact_edge_index = {}
         edge_types = set()
         reverse_edge_types = set()
 
+        # Create mapping from global to local indices
         global_to_local_idx = {aa_type: {} for aa_type in unique_amino_acids}
         current_idx = {aa_type: 0 for aa_type in unique_amino_acids}
 
@@ -49,6 +58,7 @@ class ProteinProcessor:
             global_to_local_idx[aa_type][idx] = current_idx[aa_type]
             current_idx[aa_type] += 1
 
+        # Compute edges based on distance threshold
         num_residues = len(amino_acids)
         for i in range(num_residues):
             residue_i, aa_i = amino_acids[i], amino_acid_types[i]
@@ -77,6 +87,7 @@ class ProteinProcessor:
                     contact_edge_index[edge_type].append([src_local, tgt_local])
                     edge_types.add(edge_type)
 
+        # Add edges and their reverse to HeteroData object
         for edge_type, edges in contact_edge_index.items():
             if edges:
                 src_type, relation, tgt_type = edge_type
@@ -90,6 +101,7 @@ class ProteinProcessor:
                 reverse_edge_tensor = torch.tensor(reverse_edges, dtype=torch.long).t().contiguous()
                 data[reverse_edge_type].edge_index = reverse_edge_tensor
 
+        # Add metadata to HeteroData object
         data.node_types = set(unique_amino_acids)
         data.edge_types = edge_types
         data.reverse_edge_types = reverse_edge_types

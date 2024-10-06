@@ -2,21 +2,16 @@
 import os
 import random
 import json
-from typing import List, Tuple, Dict
 
 # Third-party imports
 import numpy as np
 import pandas as pd
 import torch
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from sklearn.model_selection import train_test_split
-import logging
-from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
-from tqdm import tqdm
-from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
+from torch.nn.parallel import DistributedDataParallel
 
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
@@ -28,14 +23,14 @@ from utils import custom_transform, collate_fn, setup_logger, collect_protein_no
 RANDOM_SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Set random seeds
+# Set random seeds for reproducibility
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
-        self.model = DDP(model.to(rank), device_ids=[rank])
+        self.model = DistributedDataParallel(model.to(rank), device_ids=[rank])
         self.rank = rank
         self.world_size = world_size
         self.criterion = criterion
@@ -151,6 +146,7 @@ class Trainer:
         return predictions, true_labels
 
 def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, graph_metadata):
+    # Set up the distributed environment
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
