@@ -67,9 +67,10 @@ class Trainer:
             transform=custom_transform
         )
 
-        # Perform a dummy forward pass
+        # Perform a dummy forward pass to initialize lazy modules and avoid
+        # "RuntimeError: Tensors must be CUDA and dense" when using DistributedDataParallel
         dummy_batch = next(iter(self.train_loader))
-        dummy_mol_data, dummy_prot_data = dummy_batch
+        dummy_mol_data, dummy_prot_data = dummy_batch['mol_batch'], dummy_batch['prot_batch']
         dummy_mol_data = dummy_mol_data.to(rank)
         dummy_prot_data = dummy_prot_data.to(rank)
         with torch.no_grad():
