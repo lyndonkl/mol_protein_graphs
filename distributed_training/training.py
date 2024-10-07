@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore")
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata):
         self.logger = setup_logger()
-        self.logger.info(f"[Rank {self.rank}] Initializing Trainer")
+        self.logger.info(f"[Rank {rank}] Initializing Trainer")
 
         self.rank = rank
         self.world_size = world_size
