@@ -94,8 +94,10 @@ class MoleculeDataset(Dataset):
         # Assign node features and positions per atom type
         for atype in unique_atom_types:
             idx = atom_type_to_indices[atype]
-            x = torch.tensor([atom_features[i] for i in idx], dtype=torch.float)
-            pos = torch.tensor(np.array([atom_positions[i] for i in idx]), dtype=torch.float)
+            x_feats = torch.tensor([atom_features[i] for i in idx], dtype=torch.float)
+            pos = torch.tensor([atom_positions[i] for i in idx], dtype=torch.float)
+            # Concatenate atom features with positions
+            x = torch.cat([x_feats, pos], dim=1)
             data[atype].x = x
             data[atype].pos = pos
 
