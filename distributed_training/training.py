@@ -30,13 +30,12 @@ from utils import custom_transform, collate_fn, setup_logger, collect_protein_no
 RANDOM_SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Set random seeds for reproducibility
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-
 # Ignore all warnings
 warnings.filterwarnings("ignore")
+
+# Set environment variables at the top-level scope
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12355'
 
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata):
@@ -63,9 +62,15 @@ class Trainer:
         self.model = self.model.to(self.rank)
         self.logger.info(f"[Rank {rank}] Model moved to device {rank}")
 
-        # Wrap the model with DistributedDataParallel
-        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
-        self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
+        try:
+            self.model = DistributedDataParallel(
+                self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True
+            )
+            self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
+        except Exception as e:
+            self.logger.error(f"[Rank {rank}] Exception during model wrapping: {e}")
+            traceback.print_exc()
+            raise e
 
         self.criterion = torch.nn.BCELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
@@ -185,11 +190,15 @@ class Trainer:
             raise e
 
 def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, graph_metadata):
+    # Set random seeds for reproducibility
+    # Set the CUDA device
+    torch.cuda.set_device(rank)
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+
     logger = setup_logger()
     logger.info(f"[Rank {rank}] Starting run function")
-    # Set up the distributed environment
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
     logger.info(f"[Rank {rank}] Process group initialized")
 
