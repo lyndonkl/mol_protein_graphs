@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import traceback
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
 
@@ -38,30 +39,37 @@ torch.manual_seed(RANDOM_SEED)
 warnings.filterwarnings("ignore")
 
 class Trainer:
-    def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
+    def __init__(self, model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata):
+        self.logger = setup_logger()
+        self.logger.info(f"[Rank {self.rank}] Initializing Trainer")
+
         self.rank = rank
         self.world_size = world_size
-        self.criterion = criterion
-        self.optimizer = optimizer
         self.model = model
 
         # Create a DistributedSampler for the training data
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=64,
             num_workers=20,
-            shuffle=False,  # DistributedSampler handles shuffling
+            shuffle=False,
             sampler=train_sampler,
             collate_fn=collate_fn
         )
 
         # Ensure model is on the correct device before performing the dummy forward pass
         self.model = self.model.to(self.rank)
+        self.logger.info(f"[Rank {rank}] Model moved to device {rank}")
 
         # Wrap the model with DistributedDataParallel
-        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank)
+        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+        self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
+
+        self.criterion = torch.nn.BCELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        logger.info(f"[Rank {rank}] Optimizer initialized")
 
         if rank == 0:
             self.val_loader = DataLoader(
@@ -79,83 +87,118 @@ class Trainer:
                 shuffle=False,
                 collate_fn=collate_fn
             )
+        
+        self.logger.info(f"[Rank {self.rank}] Train loader initialized with {len(self.train_loader)} batches")
 
     def train_epoch(self, epoch):
-        # Set the epoch for the DistributedSampler
-        self.train_loader.sampler.set_epoch(epoch)
+        try:
+            # Set the epoch for the DistributedSampler
+            self.logger.info(f"[Rank {self.rank}] Starting training epoch {epoch}")
+            self.train_loader.sampler.set_epoch(epoch)
 
-        self.model.train()
-        total_loss = torch.zeros(2).to(self.rank)
-        for mol_data, prot_data, batch_size in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
-            self.optimizer.zero_grad()
-            out = self.model(mol_data, prot_data)
-            
-            out = out[:batch_size]
-            y = mol_data['smolecule'].y[:batch_size].to(self.rank)
+            self.model.train()
+            total_loss = torch.zeros(1).to(self.rank)
+            total_samples = torch.zeros(1).to(self.rank)
+            for mol_data, prot_data in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
+                self.optimizer.zero_grad()
+                mol_data = mol_data.to(self.rank)
+                prot_data = prot_data.to(self.rank)
+                out = self.model(mol_data, prot_data)
+                y = mol_data['smolecule'].y.to(device)
 
-            loss = self.criterion(out, y)
-            loss.backward()
-            self.optimizer.step()
+                loss = self.criterion(out, y)
+                loss.backward()
+                self.optimizer.step()
 
-            total_loss[0] += float(loss) * batch_size
-            total_loss[1] += batch_size
+                batch_size = y.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
 
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        return float(total_loss[0] / total_loss[1])
+                if batch_size % 100 == 0:
+                    self.logger.info(f"[Rank {self.rank}] Processing batch {batch_idx}")
+
+            self.logger.info(f"[Rank {self.rank}] Finished training epoch {epoch}")
+
+            # Perform all_reduce on total_loss and total_samples
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
+            self.logger.info(f"[Rank {self.rank}] Completed dist.all_reduce in epoch {epoch}")
+
+            average_loss = total_loss.item() / total_samples.item()
+            return average_loss
+        except Exception as e:
+            self.logger.error(f"[Rank {self.rank}] Error in train_epoch: {e}")
+            traceback.print_exc()
+            raise e
 
     def validate(self):
-        if self.rank != 0:
-            return None
-        
-        self.model.eval()
-        total_loss = 0
-        total_samples = 0
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating"):
-                mol_data = batch['mol_batch'].to(self.rank)
-                prot_data = batch['prot_batch'].to(self.rank)
-                batch_size = batch['batch_size']
-                out = self.model(mol_data, prot_data)
-                out = out[:batch_size]
-                y = mol_data['smolecule'].y[:batch_size].to(self.rank)
-                loss = self.criterion(out, y)
-                total_loss += float(loss) * batch_size
-                total_samples += batch_size
-        return total_loss / total_samples
+        try:
+            if self.rank != 0:
+                return None
+            
+            self.logger.info(f"[Rank {self.rank}] Starting validation")
+            self.model.eval()
+            total_loss = 0
+            total_samples = 0
+            with torch.no_grad():
+                for batch in tqdm(self.val_loader, desc="Validating"):
+                    mol_data = batch['mol_batch'].to(self.rank)
+                    prot_data = batch['prot_batch'].to(self.rank)
+                    out = self.model(mol_data, prot_data)
+                    y = mol_data['smolecule'].y.to(self.rank)
+                    
+                    loss = self.criterion(out, y)
+                    batch_size = y.size(0)
+                    total_loss += loss.item() * batch_size
+                    total_samples += batch_size
+
+            self.logger.info(f"[Rank {self.rank}] Finished validation")
+
+            return total_loss / total_samples
+        except Exception as e:
+            self.logger.error(f"[Rank {self.rank}] Error in validate: {e}")
+            traceback.print_exc()
+            raise e
 
     def test(self):
-        if self.rank != 0:
-            return None, None
-        
-        self.model.eval()
-        predictions = []
-        true_labels = []
-        with torch.no_grad():
-            for batch in tqdm(self.test_loader, desc="Testing"):
-                mol_data = batch['mol_batch'].to(self.rank)
-                prot_data = batch['prot_batch'].to(self.rank)
-                batch_size = batch['batch_size']
-                out = self.model(mol_data, prot_data)
-                out = out[:batch_size]
-                predictions.extend(out.cpu().numpy())
-                true_labels.extend(mol_data['smolecule'].y[:batch_size].cpu().numpy())
-        return predictions, true_labels
+        try:
+            if self.rank != 0:
+                return None, None
+            
+            self.model.eval()
+            predictions = []
+            true_labels = []
+            with torch.no_grad():
+                for batch in tqdm(self.test_loader, desc="Testing"):
+                    mol_data = batch['mol_batch'].to(self.rank)
+                    prot_data = batch['prot_batch'].to(self.rank)
+                    out = self.model(mol_data, prot_data)
+                    y = mol_data['smolecule'].y.to(self.rank)
+
+                    predictions.extend(out.cpu().numpy())
+                    true_labels.extend(y.cpu().numpy())
+
+            return predictions, true_labels
+        except Exception as e:
+            self.logger.error(f"[Rank {self.rank}] Error in test: {e}")
+            traceback.print_exc()
+            raise e
 
 def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, graph_metadata):
+    logger = setup_logger()
+    logger.info(f"[Rank {rank}] Starting run function")
     # Set up the distributed environment
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
-
-    logger = setup_logger() if rank == 0 else None
+    logger.info(f"[Rank {rank}] Process group initialized")
 
     # Initialize model, criterion, and optimizer
     model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
-    criterion = torch.nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    logger.info(f"[Rank {rank}] Model initialized")
 
     # Train the model
-    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata)
+    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata)
 
     num_epochs = 5  # Set your number of epochs
     best_val_loss = float('inf')
@@ -198,6 +241,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
         logger.info(f"F1-Score: {f1:.4f}")
 
     dist.destroy_process_group()
+    logger.info(f"[Rank {rank}] Destroyed process group and exiting")
 
 def main():
     # Load and preprocess data
