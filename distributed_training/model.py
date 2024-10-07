@@ -68,9 +68,11 @@ class CrossGraphAttentionModel(torch.nn.Module):
         # Linear layers for edge attributes
         self.edge_lin = torch.nn.ModuleDict()
         for edge_type in self.molecule_edge_types:
-            self.edge_lin[edge_type] = Linear(mol_edge_input_dim, hidden_dim)
+            edge_type_str = '__'.join(edge_type)
+            self.edge_lin[edge_type_str] = Linear(mol_edge_input_dim, hidden_dim)
         for edge_type in self.protein_edge_types:
-            self.edge_lin[edge_type] = Linear(prot_edge_input_dim, hidden_dim)
+            edge_type_str = '__'.join(edge_type)
+            self.edge_lin[edge_type_str] = Linear(prot_edge_input_dim, hidden_dim)
 
         # Define molecule graph convolutions
         self.mol_convs = torch.nn.ModuleList()
@@ -118,9 +120,10 @@ class CrossGraphAttentionModel(torch.nn.Module):
 
         # Process molecule edge attributes
         for edge_type in mol_data.edge_types:
+            edge_type_str = '__'.join(edge_type)
             if 'edge_attr' in mol_data[edge_type]:
                 edge_attr = mol_data[edge_type].edge_attr
-                mol_data[edge_type].edge_attr = self.edge_lin[edge_type](edge_attr)
+                mol_data[edge_type].edge_attr = self.edge_lin[edge_type_str](edge_attr)
 
         # Process protein node features
         for node_type in prot_data.node_types:
@@ -129,9 +132,10 @@ class CrossGraphAttentionModel(torch.nn.Module):
 
         # Process protein edge attributes
         for edge_type in prot_data.edge_types:
+            edge_type_str = '__'.join(edge_type)
             if 'edge_attr' in prot_data[edge_type]:
                 edge_attr = prot_data[edge_type].edge_attr
-                prot_data[edge_type].edge_attr = self.edge_lin[edge_type](edge_attr)
+                prot_data[edge_type].edge_attr = self.edge_lin[edge_type_str](edge_attr)
 
         # Prepare edge attribute dictionaries
         edge_attr_mol_dict = {edge_type: mol_data[edge_type].edge_attr for edge_type in mol_data.edge_types}
@@ -142,8 +146,11 @@ class CrossGraphAttentionModel(torch.nn.Module):
         edge_index_mol_dict = mol_data.edge_index_dict
 
         for conv in self.mol_convs:
-            x_mol_dict = {key: F.relu(x) for key, x in conv(
-                x_mol_dict, edge_index_mol_dict, edge_attr=edge_attr_mol_dict).items()}
+            x_mol_dict = {
+                key: F.relu(x) for key, x in conv(
+                    x_mol_dict, edge_index_mol_dict, edge_attr=edge_attr_mol_dict
+                ).items()
+            }
 
         H_mol = torch.cat(
             [x_mol_dict[nt] for nt in self.molecule_node_types if nt in x_mol_dict], dim=0)
@@ -153,8 +160,11 @@ class CrossGraphAttentionModel(torch.nn.Module):
         edge_index_prot_dict = prot_data.edge_index_dict
 
         for conv in self.prot_convs:
-            x_prot_dict = {key: F.relu(x) for key, x in conv(
-                x_prot_dict, edge_index_prot_dict, edge_attr=edge_attr_prot_dict).items()}
+            x_prot_dict = {
+                key: F.relu(x) for key, x in conv(
+                    x_prot_dict, edge_index_prot_dict, edge_attr=edge_attr_prot_dict
+                ).items()
+            }
 
         H_prot = torch.cat(
             [x_prot_dict[nt] for nt in self.protein_node_types if nt in x_prot_dict], dim=0)

@@ -51,24 +51,14 @@ class Trainer:
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=64,
-            num_workers=4,
+            num_workers=20,
             shuffle=False,  # DistributedSampler handles shuffling
             sampler=train_sampler,
             collate_fn=collate_fn
         )
 
-        # Perform a dummy forward pass to initialize lazy modules
-        dummy_batch = next(iter(self.train_loader))
-        dummy_mol_data, dummy_prot_data, _ = dummy_batch
-        dummy_mol_data = dummy_mol_data.to(self.rank)
-        dummy_prot_data = dummy_prot_data.to(self.rank)
-
         # Ensure model is on the correct device before performing the dummy forward pass
         self.model = self.model.to(self.rank)
-        
-        # Run the dummy forward pass
-        with torch.no_grad():
-            _ = self.model(dummy_mol_data, dummy_prot_data)
 
         # Wrap the model with DistributedDataParallel
         self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank)

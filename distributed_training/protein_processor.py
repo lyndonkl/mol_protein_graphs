@@ -93,7 +93,8 @@ class ProteinProcessor:
                     src_local = global_to_local_idx[src_aa][src_global]
                     tgt_local = global_to_local_idx[tgt_aa][tgt_global]
 
-                    contact_edge_index[edge_type].append([src_local, tgt_local])
+                    # Append edge index and attributes
+                    contact_edge_index[edge_type]['edge_index'].append([src_local, tgt_local])
                     contact_edge_index[edge_type]['edge_attr'].append([distance, seq_separation])
                     edge_types.add(edge_type)
 
