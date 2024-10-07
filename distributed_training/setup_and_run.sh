@@ -11,6 +11,11 @@ command_exists () {
 # Update pip
 pip install --upgrade pip
 
+export MASTER_ADDR=localhost
+export MASTER_PORT=12355
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=ALL
+
 # Detect CUDA version
 if command_exists nvidia-smi && command_exists nvcc; then
     CUDA_VERSION=$(nvcc --version | grep "release" | sed 's/.*release //' | sed 's/,.*//') 
