@@ -39,24 +39,22 @@ torch.manual_seed(RANDOM_SEED)
 warnings.filterwarnings("ignore")
 
 class Trainer:
-    def __init__(self, model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata):
+    def __init__(self, model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata):
         self.logger = setup_logger()
         self.logger.info(f"[Rank {self.rank}] Initializing Trainer")
 
         self.rank = rank
         self.world_size = world_size
-        self.criterion = criterion
-        self.optimizer = optimizer
         self.model = model
 
         # Create a DistributedSampler for the training data
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=64,
             num_workers=20,
-            shuffle=False,  # DistributedSampler handles shuffling
+            shuffle=False,
             sampler=train_sampler,
             collate_fn=collate_fn
         )
@@ -66,8 +64,12 @@ class Trainer:
         self.logger.info(f"[Rank {rank}] Model moved to device {rank}")
 
         # Wrap the model with DistributedDataParallel
-        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank)
+        self.model = DistributedDataParallel(self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
         self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
+
+        self.criterion = torch.nn.BCELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        logger.info(f"[Rank {rank}] Optimizer initialized")
 
         if rank == 0:
             self.val_loader = DataLoader(
@@ -194,11 +196,9 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     # Initialize model, criterion, and optimizer
     model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
     logger.info(f"[Rank {rank}] Model initialized")
-    criterion = torch.nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Train the model
-    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, rank, world_size, graph_metadata)
+    trainer = Trainer(model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata)
 
     num_epochs = 5  # Set your number of epochs
     best_val_loss = float('inf')
