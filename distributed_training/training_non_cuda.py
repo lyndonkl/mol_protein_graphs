@@ -4,6 +4,7 @@ import random
 import json
 
 # Third-party imports
+# Standard library imports
 import warnings
 
 # Third-party imports
@@ -28,7 +29,7 @@ from utils import custom_transform, collate_fn, setup_logger, collect_protein_no
 
 # Constants
 RANDOM_SEED = 42
-DEVICE = torch.device('cpu')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Ignore all warnings
 warnings.filterwarnings("ignore")
@@ -59,12 +60,12 @@ class Trainer:
         )
 
         # Ensure model is on the correct device before performing the dummy forward pass
-        self.model = self.model.to(DEVICE)
-        self.logger.info(f"[Rank {rank}] Model moved to CPU")
+        self.model = self.model.to(self.rank)
+        self.logger.info(f"[Rank {rank}] Model moved to device {rank}")
 
         try:
             self.model = DistributedDataParallel(
-                self.model, device_ids=None, output_device=None
+                self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True
             )
             self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
         except Exception as e:
@@ -102,14 +103,14 @@ class Trainer:
             self.train_loader.sampler.set_epoch(epoch)
 
             self.model.train()
-            total_loss = torch.zeros(1).to(DEVICE)
-            total_samples = torch.zeros(1).to(DEVICE)
+            total_loss = torch.zeros(1).to(self.rank)
+            total_samples = torch.zeros(1).to(self.rank)
             for mol_data, prot_data, batch_size in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
                 self.optimizer.zero_grad()
-                mol_data = mol_data.to(DEVICE)
-                prot_data = prot_data.to(DEVICE)
+                mol_data = mol_data.to(self.rank)
+                prot_data = prot_data.to(self.rank)
                 out = self.model(mol_data, prot_data)
-                y = mol_data['smolecule'].y.to(DEVICE)
+                y = mol_data['smolecule'].y.to(device)
 
                 loss = self.criterion(out, y)
                 loss.backward()
@@ -146,10 +147,10 @@ class Trainer:
             total_samples = 0
             with torch.no_grad():
                 for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating"):
-                    mol_data = mol_data.to(DEVICE)
-                    prot_data = prot_data.to(DEVICE)
+                    mol_data = mol_data.to(self.rank)
+                    prot_data = prot_data.to(self.rank)
                     out = self.model(mol_data, prot_data)
-                    y = mol_data['smolecule'].y.to(DEVICE)
+                    y = mol_data['smolecule'].y.to(self.rank)
                     
                     loss = self.criterion(out, y)
                     total_loss += loss.item() * batch_size
@@ -173,10 +174,10 @@ class Trainer:
             true_labels = []
             with torch.no_grad():
                 for mol_data, prot_data, batch_size in tqdm(self.test_loader, desc="Testing"):
-                    mol_data = mol_data.to(DEVICE)
-                    prot_data = prot_data.to(DEVICE)
+                    mol_data = mol_data.to(self.rank)
+                    prot_data = prot_data.to(self.rank)
                     out = self.model(mol_data, prot_data)
-                    y = mol_data['smolecule'].y.to(DEVICE)
+                    y = mol_data['smolecule'].y.to(self.rank)
 
                     predictions.extend(out.cpu().numpy())
                     true_labels.extend(y.cpu().numpy())
@@ -189,13 +190,15 @@ class Trainer:
 
 def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, graph_metadata):
     # Set random seeds for reproducibility
+    # Set the CUDA device
+    torch.cuda.set_device(rank)
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
 
     logger = setup_logger()
     logger.info(f"[Rank {rank}] Starting run function")
-    dist.init_process_group('gloo', rank=rank, world_size=world_size)
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
     logger.info(f"[Rank {rank}] Process group initialized")
 
     # Initialize model, criterion, and optimizer
@@ -286,7 +289,7 @@ def main():
     val_dataset = CombinedDataset(val_df, protein_graphs)
     test_dataset = CombinedDataset(test_df, protein_graphs)
 
-    world_size = mp.cpu_count()
+    world_size = torch.cuda.device_count()
     mp.spawn(run, args=(world_size, train_dataset, val_dataset, test_dataset, graph_metadata), nprocs=world_size, join=True)
 
 if __name__ == '__main__':
