@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 import traceback
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -74,13 +75,13 @@ class Trainer:
 
         self.criterion = torch.nn.BCELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
-        logger.info(f"[Rank {rank}] Optimizer initialized")
+        self.logger.info(f"[Rank {rank}] Optimizer initialized")
 
         if rank == 0:
             self.val_loader = DataLoader(
                 val_dataset,
                 batch_size=64,
-                num_workers=4,
+                num_workers=20,
                 shuffle=False,
                 collate_fn=collate_fn
             )
@@ -88,7 +89,7 @@ class Trainer:
             self.test_loader = DataLoader(
                 test_dataset,
                 batch_size=64,
-                num_workers=4,
+                num_workers=20,
                 shuffle=False,
                 collate_fn=collate_fn
             )
