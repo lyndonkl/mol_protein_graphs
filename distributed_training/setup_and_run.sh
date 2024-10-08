@@ -13,8 +13,9 @@ pip install --upgrade pip
 
 export MASTER_ADDR=localhost
 export MASTER_PORT=12355
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=ALL
+export NCCL_P2P_DISABLE=1
+# export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=ALL
 
 # Detect CUDA version
 if command_exists nvidia-smi && command_exists nvcc; then
