@@ -28,8 +28,12 @@ class MoleculeDataset(Dataset):
     def get(self, idx):
         row = self.dataframe.iloc[idx]
         smiles = row['molecule_smiles']
-        binds = row['binds']
         protein_name = row['protein_name']
+
+        if 'binds' in row:
+            binds = row['binds']
+        else:
+            binds = 0
 
         if 'id' in row:
             molecule_id = row['id']
@@ -181,7 +185,7 @@ class MoleculeDataset(Dataset):
         data['smolecule'].y = torch.tensor([binds], dtype=torch.float)
         data['smolecule'].smiles = smiles
         data['smolecule'].protein_name = protein_name
-        data['smolecule'].id = molecule_id
+        data['smolecule'].id = torch.tensor([molecule_id], dtype=torch.long)
 
         data.node_types = set(unique_atom_types)
         data.edge_types = set(bond_edges.keys())
@@ -218,21 +222,25 @@ class CombinedDataset(Dataset):
         self.dataframe = dataframe.reset_index(drop=True)
         self.protein_graphs = protein_graphs
         self.cache_dir = cache_dir
-        os.makedirs(self.cache_dir, exist_ok=True)
+        # os.makedirs(self.cache_dir, exist_ok=True)
         super(CombinedDataset, self).__init__(None, transform, pre_transform)
 
     def len(self):
         return len(self.dataframe)
 
     def get(self, idx):
-        processed_file = os.path.join(self.cache_dir, f'data_{idx}.pt')
+        row = self.dataframe.iloc[idx]
+        molecule_id = row['id']
+        processed_file = os.path.join(self.cache_dir, f'data_{molecule_id}.pt')
         if os.path.exists(processed_file):
             molecule_data, protein_data = torch.load(processed_file)
         else:
-            row = self.dataframe.iloc[idx]
             smiles = row['molecule_smiles']
-            binds = row['binds']
             protein_name = row['protein_name']
+            binds = 0
+
+            if 'binds' in row:
+                binds = row['binds']
 
             mol_dataset = MoleculeDataset(pd.DataFrame([row]))
             molecule_data = mol_dataset.get(0)
@@ -244,7 +252,8 @@ class CombinedDataset(Dataset):
             molecule_data.y = torch.tensor([binds], dtype=torch.float)
             molecule_data.smiles = smiles
             molecule_data.protein_name = protein_name
+            molecule_data.id = torch.tensor([molecule_id], dtype=torch.long)
 
-            torch.save((molecule_data, protein_data), processed_file)
+            # torch.save((molecule_data, protein_data), processed_file)
 
         return molecule_data, protein_data
