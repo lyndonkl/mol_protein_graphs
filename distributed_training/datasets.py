@@ -166,6 +166,7 @@ class MoleculeDataset(Dataset):
         data['smolecule'].y = torch.tensor([binds], dtype=torch.float)
         data['smolecule'].smiles = smiles
         data['smolecule'].protein_name = protein_name
+        data['smolecule'].id = molecule_id
 
         data.node_types = set(unique_atom_types)
         data.edge_types = set(bond_edges.keys())
