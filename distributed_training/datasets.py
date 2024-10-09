@@ -27,6 +27,11 @@ class MoleculeDataset(Dataset):
         binds = row['binds']
         protein_name = row['protein_name']
 
+        if 'id' in row:
+            molecule_id = row['id']
+        else:
+            molecule_id = None
+
         # Convert SMILES to molecular graph
         mol = Chem.MolFromSmiles(smiles)
         data = HeteroData()
