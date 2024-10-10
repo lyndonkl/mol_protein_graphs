@@ -98,8 +98,10 @@ class MoleculeDataset(Dataset):
         # Assign node features and positions per atom type
         for atype in unique_atom_types:
             idx = atom_type_to_indices[atype]
-            x_feats = torch.tensor([atom_features[i] for i in idx], dtype=torch.float)
-            pos = torch.tensor([atom_positions[i] for i in idx], dtype=torch.float)
+            feature_list = np.array([atom_features[i] for i in idx])
+            x_feats = torch.tensor(feature_list, dtype=torch.float)
+            pos_list = np.array([atom_positions[i] for i in idx])
+            pos = torch.tensor(pos_list, dtype=torch.float)
             # Concatenate atom features with positions
             x = torch.cat([x_feats, pos], dim=1)
             data[atype].x = x
@@ -157,7 +159,8 @@ class MoleculeDataset(Dataset):
         # Assign bond edges to HeteroData
         for edge_type, attrs in bond_edges.items():
             edge_index = torch.tensor(attrs['edge_index'], dtype=torch.long).t().contiguous()
-            edge_attr = torch.tensor(attrs['edge_attr'], dtype=torch.float)
+            edge_attrs_list = np.array(attrs['edge_attr'])
+            edge_attr = torch.tensor(edge_attrs_list, dtype=torch.float)
             data[edge_type].edge_index = edge_index
             data[edge_type].edge_attr = edge_attr
 
@@ -174,16 +177,32 @@ class MoleculeDataset(Dataset):
 
     @staticmethod
     def get_atom_features(atom):
-        return [
-            atom.GetAtomicNum(),
+        atomic_number = atom.GetAtomicNum()
+        mol = atom.GetOwningMol()
+
+        # Pauling electronegativity values for common elements
+        electronegativity = {
+            1: 2.20, 6: 2.55, 7: 3.04, 8: 3.44, 9: 3.98, 15: 2.19, 16: 2.58, 17: 3.16,
+            35: 2.96, 53: 2.66
+        }
+        
+        features = [
+            atomic_number,
             atom.GetTotalDegree(),
             atom.GetFormalCharge(),
             atom.GetHybridization().real,
-            int(atom.GetIsAromatic())
+            int(atom.GetIsAromatic()),
+            Chem.GetPeriodicTable().GetRvdw(atomic_number),
+            electronegativity.get(atomic_number, 0), 
+            Chem.GetPeriodicTable().GetNOuterElecs(atomic_number)
         ]
+        
+        # Return as a numpy array
+        return np.array(features, dtype=np.float32)
 
     @staticmethod
     def get_bond_features(bond):
+        mol = bond.GetOwningMol()
         bond_type = bond.GetBondType()
         bond_dict = {
             Chem.rdchem.BondType.SINGLE: 0,
@@ -192,9 +211,46 @@ class MoleculeDataset(Dataset):
             Chem.rdchem.BondType.AROMATIC: 3
         }
 
-        return [
-            bond_dict.get(bond_type, -1)
+        # Calculate bond length manually
+        conf = mol.GetConformer()
+        a1 = conf.GetAtomPosition(bond.GetBeginAtomIdx())
+        a2 = conf.GetAtomPosition(bond.GetEndAtomIdx())
+        bond_length = np.linalg.norm(np.array([a1.x - a2.x, a1.y - a2.y, a1.z - a2.z]))
+
+        features = [
+            bond_dict.get(bond_type, -1),
+            bond_length,
+            int(bond.GetIsConjugated()),
+            int(bond.IsInRing()),
+            int(bond.GetIsAromatic()),
+            bond.GetValenceContrib(bond.GetBeginAtom()),
+            bond.GetValenceContrib(bond.GetEndAtom()),
         ]
+
+        # Stereo configuration
+        stereo = bond.GetStereo()
+        stereo_dict = {
+            Chem.rdchem.BondStereo.STEREONONE: 0,
+            Chem.rdchem.BondStereo.STEREOANY: 1,
+            Chem.rdchem.BondStereo.STEREOZ: 2,
+            Chem.rdchem.BondStereo.STEREOE: 3,
+        }
+        features.append(stereo_dict.get(stereo, -1))
+
+        # Bond angles
+        begin_atom = bond.GetBeginAtom()
+        end_atom = bond.GetEndAtom()
+        if begin_atom.GetDegree() > 1 and end_atom.GetDegree() > 1:
+            conf = mol.GetConformer()
+            begin_neighbors = [a.GetIdx() for a in begin_atom.GetNeighbors() if a.GetIdx() != end_atom.GetIdx()]
+            end_neighbors = [a.GetIdx() for a in end_atom.GetNeighbors() if a.GetIdx() != begin_atom.GetIdx()]
+            begin_angle = Chem.rdMolTransforms.GetAngleDeg(conf, begin_neighbors[0], begin_atom.GetIdx(), end_atom.GetIdx())
+            end_angle = Chem.rdMolTransforms.GetAngleDeg(conf, begin_atom.GetIdx(), end_atom.GetIdx(), end_neighbors[0])
+            features.extend([begin_angle, end_angle])
+        else:
+            features.extend([0, 0])  # Placeholder for molecules without angles
+
+        return np.array(features, dtype=np.float32)
 
 
 class CombinedDataset(Dataset):

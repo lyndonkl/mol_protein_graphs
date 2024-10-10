@@ -53,9 +53,9 @@ class CrossGraphAttentionModel(torch.nn.Module):
         self.protein_edge_types = graph_metadata['protein_edge_types']
 
         # Define input dimensions based on data
-        mol_node_input_dim = 8  # Molecule node features (e.g., 5 features + 3 positions)
+        mol_node_input_dim = 11  # Molecule node features (e.g., 8 features + 3 positions)
         prot_node_input_dim = 4  # Protein node features (e.g., 1 feature + 3 positions)
-        mol_edge_input_dim = 2   # Molecule edge attributes (e.g., bond type + distance)
+        mol_edge_input_dim = 10  # Molecule edge attributes
         prot_edge_input_dim = 2  # Protein edge attributes (e.g., distance + seq separation)
 
         # Linear layers for node features
@@ -115,8 +115,9 @@ class CrossGraphAttentionModel(torch.nn.Module):
     def forward(self, mol_data: HeteroData, prot_data: HeteroData) -> torch.Tensor:
         # Process molecule node features
         for node_type in mol_data.node_types:
-            x = mol_data[node_type].x
-            mol_data[node_type].x = self.node_lin[node_type](x)
+            if node_type != 'smolecule':
+                x = mol_data[node_type].x
+                mol_data[node_type].x = self.node_lin[node_type](x)
 
         # Process molecule edge attributes
         for edge_type in mol_data.edge_types:
@@ -146,11 +147,8 @@ class CrossGraphAttentionModel(torch.nn.Module):
         edge_index_mol_dict = mol_data.edge_index_dict
 
         for conv in self.mol_convs:
-            x_mol_dict = {
-                key: F.relu(x) for key, x in conv(
-                    x_mol_dict, edge_index_mol_dict, edge_attr=edge_attr_mol_dict
-                ).items()
-            }
+            x_mol_dict = conv(x_mol_dict, edge_index_mol_dict, edge_attr_dict=edge_attr_mol_dict)
+            x_mol_dict = {key: F.relu(x) for key, x in x_mol_dict.items()}
 
         H_mol = torch.cat(
             [x_mol_dict[nt] for nt in self.molecule_node_types if nt in x_mol_dict], dim=0)
@@ -160,11 +158,8 @@ class CrossGraphAttentionModel(torch.nn.Module):
         edge_index_prot_dict = prot_data.edge_index_dict
 
         for conv in self.prot_convs:
-            x_prot_dict = {
-                key: F.relu(x) for key, x in conv(
-                    x_prot_dict, edge_index_prot_dict, edge_attr=edge_attr_prot_dict
-                ).items()
-            }
+            x_prot_dict = conv(x_prot_dict, edge_index_prot_dict, edge_attr_dict=edge_attr_prot_dict)
+            x_prot_dict = {key: F.relu(x) for key, x in x_prot_dict.items()}
 
         H_prot = torch.cat(
             [x_prot_dict[nt] for nt in self.protein_node_types if nt in x_prot_dict], dim=0)

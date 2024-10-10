@@ -25,7 +25,7 @@ from sklearn.model_selection import train_test_split
 from datasets import CombinedDataset, MoleculeDataset
 from protein_processor import ProteinProcessor
 from model import CrossAttentionLayer, CrossGraphAttentionModel
-from utils import custom_transform, collate_fn, setup_logger, collect_protein_node_and_edge_types
+from utils import custom_transform, setup_logger, collect_protein_node_and_edge_types
 
 # Constants
 RANDOM_SEED = 42
@@ -55,8 +55,7 @@ class Trainer:
             batch_size=64,
             num_workers=20,
             shuffle=False,
-            sampler=train_sampler,
-            collate_fn=collate_fn
+            sampler=train_sampler
         )
 
         # Ensure model is on the correct device before performing the dummy forward pass
@@ -82,16 +81,14 @@ class Trainer:
                 val_dataset,
                 batch_size=64,
                 num_workers=20,
-                shuffle=False,
-                collate_fn=collate_fn
+                shuffle=False
             )
             
             self.test_loader = DataLoader(
                 test_dataset,
                 batch_size=64,
                 num_workers=20,
-                shuffle=False,
-                collate_fn=collate_fn
+                shuffle=False
             )
         
         self.logger.info(f"[Rank {self.rank}] Train loader initialized with {len(self.train_loader)} batches")

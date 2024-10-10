@@ -47,7 +47,7 @@ class ProteinProcessor:
             pos = torch.tensor(node_positions[aa_type], dtype=torch.float)
             # Concatenate node features with positions
             x = torch.cat([x_feats, pos], dim=1)
-            data[f"{aa_type}_protein"].x = x
+            data[aa_type].x = x
 
         # Initialize edge data structures
         contact_edge_index = {}
@@ -83,8 +83,8 @@ class ProteinProcessor:
                 seq_separation = abs(res_id_i - res_id_j)
 
                 if distance <= threshold:
-                    edge_type = (f"{aa_i}_protein", 'contact', f"{aa_j}_protein") if aa_i <= aa_j else (f"{aa_j}_protein", 'contact', f"{aa_i}_protein")
-                    src_aa, tgt_aa = edge_type[0].split('_')[0], edge_type[2].split('_')[0]
+                    edge_type = (aa_i, 'contact', aa_j) if aa_i <= aa_j else (aa_j, 'contact', aa_i)
+                    src_aa, tgt_aa = edge_type[0], edge_type[2]
                     src_global, tgt_global = (i, j) if aa_i <= aa_j else (j, i)
 
                     if edge_type not in contact_edge_index:
@@ -118,7 +118,7 @@ class ProteinProcessor:
                 data[reverse_edge_type].edge_attr = reverse_edge_attr
 
         # Add metadata to HeteroData object
-        data.node_types = set(f"{aa}_protein" for aa in unique_amino_acids)
+        data.node_types = set(unique_amino_acids)
         data.edge_types = edge_types.union(reverse_edge_types)
         data.reverse_edge_types = reverse_edge_types
 
