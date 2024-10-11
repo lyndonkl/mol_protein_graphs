@@ -23,7 +23,7 @@ from sklearn.model_selection import train_test_split
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
 from protein_processor import ProteinProcessor
-from model import CrossAttentionLayer, CrossGraphAttentionModel
+from model import CrossAttentionLayer, StackedCrossGraphAttentionModel
 from utils import custom_transform, setup_logger, collect_protein_node_and_edge_types
 
 # Constants
@@ -200,7 +200,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     logger.info(f"[Rank {rank}] Process group initialized with backend {backend}")
 
     # Initialize model, criterion, and optimizer
-    model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
+    model = StackedCrossGraphAttentionModel(graph_metadata, hidden_dim=128, num_attention_heads=8, num_layers=4)
     logger.info(f"[Rank {rank}] Model initialized")
 
     # Train the model
@@ -251,7 +251,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
 
 def main():
     # Load and preprocess data
-    df = pd.read_parquet('cleaned_train.parquet')
+    df = pd.read_parquet('../cleaned_train.parquet')
     train_df, temp_df = train_test_split(df, test_size=0.3, stratify=df['binds'], random_state=RANDOM_SEED)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, stratify=temp_df['binds'], random_state=RANDOM_SEED)
 
@@ -261,15 +261,15 @@ def main():
 
     # Process proteins
     protein_pdb_files = {
-        'BRD4': './BRD4.pdb',
-        'HSA': './ALB.pdb',
-        'sEH': './EPH.pdb'
+        'BRD4': '../BRD4.pdb',
+        'HSA': '../ALB.pdb',
+        'sEH': '../EPH.pdb'
     }
     protein_graphs = {protein_name: ProteinProcessor.process_protein(pdb_file) 
                       for protein_name, pdb_file in protein_pdb_files.items() if os.path.exists(pdb_file)}
 
     # Load unique atom and edge types
-    with open('unique_atom_and_edge_types.json', 'r') as f:
+    with open('../unique_atom_and_edge_types.json', 'r') as f:
         unique_types = json.load(f)
 
     molecule_node_types = unique_types['molecule_node_types']

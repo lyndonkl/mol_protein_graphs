@@ -24,8 +24,8 @@ from sklearn.model_selection import train_test_split
 # Custom imports
 from datasets import CombinedDataset, MoleculeDataset
 from protein_processor import ProteinProcessor
-from model import CrossAttentionLayer, CrossGraphAttentionModel
-from utils import custom_transform, setup_logger, collect_protein_node_and_edge_types
+from model import CrossAttentionLayer, StackedCrossGraphAttentionModel
+from utils import setup_logger, collect_protein_node_and_edge_types, collate_fn
 
 # Constants
 RANDOM_SEED = 42
@@ -52,10 +52,11 @@ class Trainer:
 
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=64,
-            num_workers=20,
+            batch_size=32,
+            num_workers=4,
             shuffle=False,
-            sampler=train_sampler
+            sampler=train_sampler,
+            collate_fn=collate_fn
         )
 
         # Ensure model is on the correct device before performing the dummy forward pass
@@ -79,16 +80,18 @@ class Trainer:
         if rank == 0:
             self.val_loader = DataLoader(
                 val_dataset,
-                batch_size=64,
-                num_workers=20,
-                shuffle=False
+                batch_size=32,
+                num_workers=4,
+                shuffle=False,
+                collate_fn=collate_fn
             )
             
             self.test_loader = DataLoader(
                 test_dataset,
-                batch_size=64,
-                num_workers=20,
-                shuffle=False
+                batch_size=32,
+                num_workers=4,
+                shuffle=False,
+                collate_fn=collate_fn
             )
         
         self.logger.info(f"[Rank {self.rank}] Train loader initialized with {len(self.train_loader)} batches")
@@ -107,7 +110,7 @@ class Trainer:
                 mol_data = mol_data.to(self.rank)
                 prot_data = prot_data.to(self.rank)
                 out = self.model(mol_data, prot_data)
-                y = mol_data['smolecule'].y.to(device)
+                y = mol_data['smolecule'].y.to(self.rank)
 
                 loss = self.criterion(out, y)
                 loss.backward()
@@ -148,7 +151,7 @@ class Trainer:
                     prot_data = prot_data.to(self.rank)
                     out = self.model(mol_data, prot_data)
                     y = mol_data['smolecule'].y.to(self.rank)
-                    
+
                     loss = self.criterion(out, y)
                     total_loss += loss.item() * batch_size
                     total_samples += batch_size
@@ -176,6 +179,7 @@ class Trainer:
                     out = self.model(mol_data, prot_data)
                     y = mol_data['smolecule'].y.to(self.rank)
 
+
                     predictions.extend(out.cpu().numpy())
                     true_labels.extend(y.cpu().numpy())
 
@@ -199,7 +203,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     logger.info(f"[Rank {rank}] Process group initialized")
 
     # Initialize model, criterion, and optimizer
-    model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
+    model = StackedCrossGraphAttentionModel(graph_metadata, hidden_dim=128, num_attention_heads=8, num_layers=4)
     logger.info(f"[Rank {rank}] Model initialized")
 
     # Train the model
