@@ -54,3 +54,13 @@ def setup_logger():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     return logger
+
+def pre_filter(data):
+    print("Pre-filtering data")
+    print(data)
+    print(data.metadata())
+    # node_types, edge_types = data.metadata()
+    # if node_types[0] == 'dummy_node':
+    #     return False
+
+    return True

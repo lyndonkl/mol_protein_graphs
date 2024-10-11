@@ -4,7 +4,6 @@ import random
 import json
 
 # Third-party imports
-# Standard library imports
 import warnings
 
 # Third-party imports
@@ -29,7 +28,7 @@ from utils import custom_transform, setup_logger, collect_protein_node_and_edge_
 
 # Constants
 RANDOM_SEED = 42
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
 # Ignore all warnings
 warnings.filterwarnings("ignore")
@@ -59,13 +58,11 @@ class Trainer:
         )
 
         # Ensure model is on the correct device before performing the dummy forward pass
-        self.model = self.model.to(self.rank)
-        self.logger.info(f"[Rank {rank}] Model moved to device {rank}")
+        self.model = self.model.to(DEVICE)
+        self.logger.info(f"[Rank {rank}] Model moved to device {DEVICE}")
 
         try:
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[rank], output_device=rank, find_unused_parameters=True
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=None)
             self.logger.info(f"[Rank {rank}] Model wrapped with DistributedDataParallel")
         except Exception as e:
             self.logger.error(f"[Rank {rank}] Exception during model wrapping: {e}")
@@ -100,14 +97,14 @@ class Trainer:
             self.train_loader.sampler.set_epoch(epoch)
 
             self.model.train()
-            total_loss = torch.zeros(1).to(self.rank)
-            total_samples = torch.zeros(1).to(self.rank)
+            total_loss = 0.0
+            total_samples = 0
             for mol_data, prot_data, batch_size in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
                 self.optimizer.zero_grad()
-                mol_data = mol_data.to(self.rank)
-                prot_data = prot_data.to(self.rank)
+                mol_data = mol_data.to(DEVICE)
+                prot_data = prot_data.to(DEVICE)
                 out = self.model(mol_data, prot_data)
-                y = mol_data['smolecule'].y.to(device)
+                y = mol_data['smolecule'].y.to(DEVICE)
 
                 loss = self.criterion(out, y)
                 loss.backward()
@@ -116,17 +113,19 @@ class Trainer:
                 total_loss += loss.item() * batch_size
                 total_samples += batch_size
 
-                if batch_size % 100 == 0:
-                    self.logger.info(f"[Rank {self.rank}] Processing batch {batch_idx}")
-
             self.logger.info(f"[Rank {self.rank}] Finished training epoch {epoch}")
 
-            # Perform all_reduce on total_loss and total_samples
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
-            self.logger.info(f"[Rank {self.rank}] Completed dist.all_reduce in epoch {epoch}")
+            # Gather losses from all processes
+            all_losses = [torch.zeros(1).to(DEVICE) for _ in range(self.world_size)]
+            all_samples = [torch.zeros(1, dtype=torch.long).to(DEVICE) for _ in range(self.world_size)]
+            
+            dist.all_gather(all_losses, torch.tensor([total_loss]).to(DEVICE))
+            dist.all_gather(all_samples, torch.tensor([total_samples]).to(DEVICE))
 
-            average_loss = total_loss.item() / total_samples.item()
+            total_loss = sum(loss.item() for loss in all_losses)
+            total_samples = sum(samples.item() for samples in all_samples)
+
+            average_loss = total_loss / total_samples
             return average_loss
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in train_epoch: {e}")
@@ -144,10 +143,10 @@ class Trainer:
             total_samples = 0
             with torch.no_grad():
                 for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating"):
-                    mol_data = mol_data.to(self.rank)
-                    prot_data = prot_data.to(self.rank)
+                    mol_data = mol_data.to(DEVICE)
+                    prot_data = prot_data.to(DEVICE)
                     out = self.model(mol_data, prot_data)
-                    y = mol_data['smolecule'].y.to(self.rank)
+                    y = mol_data['smolecule'].y.to(DEVICE)
                     
                     loss = self.criterion(out, y)
                     total_loss += loss.item() * batch_size
@@ -171,10 +170,10 @@ class Trainer:
             true_labels = []
             with torch.no_grad():
                 for mol_data, prot_data, batch_size in tqdm(self.test_loader, desc="Testing"):
-                    mol_data = mol_data.to(self.rank)
-                    prot_data = prot_data.to(self.rank)
+                    mol_data = mol_data.to(DEVICE)
+                    prot_data = prot_data.to(DEVICE)
                     out = self.model(mol_data, prot_data)
-                    y = mol_data['smolecule'].y.to(self.rank)
+                    y = mol_data['smolecule'].y.to(DEVICE)
 
                     predictions.extend(out.cpu().numpy())
                     true_labels.extend(y.cpu().numpy())
@@ -187,16 +186,18 @@ class Trainer:
 
 def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, graph_metadata):
     # Set random seeds for reproducibility
-    # Set the CUDA device
-    torch.cuda.set_device(rank)
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
 
     logger = setup_logger()
     logger.info(f"[Rank {rank}] Starting run function")
-    dist.init_process_group('nccl', rank=rank, world_size=world_size)
-    logger.info(f"[Rank {rank}] Process group initialized")
+    
+    # Use 'gloo' backend for CPU and MPS
+    backend = 'gloo'
+    
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    logger.info(f"[Rank {rank}] Process group initialized with backend {backend}")
 
     # Initialize model, criterion, and optimizer
     model = CrossGraphAttentionModel(graph_metadata, hidden_dim=64, num_attention_heads=4)
@@ -286,7 +287,9 @@ def main():
     val_dataset = CombinedDataset(val_df, protein_graphs)
     test_dataset = CombinedDataset(test_df, protein_graphs)
 
-    world_size = torch.cuda.device_count()
+    # For CPU, use the number of available cores. For MPS, use 1.
+    world_size = mp.cpu_count() if DEVICE.type == 'cpu' else 1
+
     mp.spawn(run, args=(world_size, train_dataset, val_dataset, test_dataset, graph_metadata), nprocs=world_size, join=True)
 
 if __name__ == '__main__':

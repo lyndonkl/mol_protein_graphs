@@ -51,4 +51,4 @@ fi
 pip install pyarrow torch_geometric biopython dask rdkit pandas scikit-learn
 
 # Run the training script
-python training.py
+python training_cuda_gpu.py

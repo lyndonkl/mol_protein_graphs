@@ -55,7 +55,7 @@ class CrossGraphAttentionModel(torch.nn.Module):
         # Define input dimensions based on data
         mol_node_input_dim = 8  # Molecule node features (e.g., 5 features + 3 positions)
         prot_node_input_dim = 4  # Protein node features (e.g., 1 feature + 3 positions)
-        mol_edge_input_dim = 2   # Molecule edge attributes (e.g., bond type + distance)
+        mol_edge_input_dim = 4   # Molecule edge attributes (e.g., bond type + distance)
         prot_edge_input_dim = 2  # Protein edge attributes (e.g., distance + seq separation)
 
         # Linear layers for node features
