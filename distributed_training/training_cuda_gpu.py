@@ -52,8 +52,8 @@ class Trainer:
 
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=32,
-            num_workers=4,
+            batch_size=64,
+            num_workers=30,
             shuffle=False,
             sampler=train_sampler,
             collate_fn=collate_fn
@@ -80,16 +80,16 @@ class Trainer:
         if rank == 0:
             self.val_loader = DataLoader(
                 val_dataset,
-                batch_size=32,
-                num_workers=4,
+                batch_size=64,
+                num_workers=30,
                 shuffle=False,
                 collate_fn=collate_fn
             )
             
             self.test_loader = DataLoader(
                 test_dataset,
-                batch_size=32,
-                num_workers=4,
+                batch_size=64,
+                num_workers=30,
                 shuffle=False,
                 collate_fn=collate_fn
             )
@@ -209,7 +209,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     # Train the model
     trainer = Trainer(model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata)
 
-    num_epochs = 5  # Set your number of epochs
+    num_epochs = 3  # Set your number of epochs
     best_val_loss = float('inf')
     for epoch in range(num_epochs):
         train_loss = trainer.train_epoch(epoch)
@@ -227,6 +227,10 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
                 # Save the model
                 torch.save(model.module.state_dict(), 'best_cross_graph_attention_model.pth')
                 logger.info(f'New best model saved at epoch {epoch}')
+
+        # All processes wait here until validation is complete
+        torch.distributed.barrier()
+
 
     if rank == 0:
         test_predictions, test_true = trainer.test()

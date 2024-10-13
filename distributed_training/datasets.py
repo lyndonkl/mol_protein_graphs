@@ -257,9 +257,9 @@ class CombinedDataset(Dataset):
     def __init__(self, dataframe, protein_graphs, transform=None, pre_transform=None, cache_dir='./processed', graph_metadata=None, pre_filter=None):
         self.dataframe = dataframe.reset_index(drop=True)
         self.protein_graphs = protein_graphs
-        self.cache_dir = cache_dir
+        # self.cache_dir = cache_dir
         self.graph_metadata = graph_metadata
-        os.makedirs(self.cache_dir, exist_ok=True)
+        # os.makedirs(self.cache_dir, exist_ok=True)
         super(CombinedDataset, self).__init__(None, transform, pre_transform, pre_filter)
 
     def len(self):
@@ -268,8 +268,9 @@ class CombinedDataset(Dataset):
     def get(self, idx):
         row = self.dataframe.iloc[idx]
         molecule_id = row['id']
-        processed_file = os.path.join(self.cache_dir, f'data_{molecule_id}.pt')
-        if os.path.exists(processed_file):
+        # processed_file = os.path.join(self.cache_dir, f'data_{molecule_id}.pt')
+        # if os.path.exists(processed_file):
+        if False:
             molecule_data, protein_data = torch.load(processed_file)
         else:
             smiles = row['molecule_smiles']
@@ -290,6 +291,6 @@ class CombinedDataset(Dataset):
             molecule_data.smiles = smiles
             molecule_data.protein_name = protein_name
             molecule_data.id = torch.tensor([molecule_id], dtype=torch.long)
-            torch.save((molecule_data, protein_data), processed_file)
+            # torch.save((molecule_data, protein_data), processed_file)
 
         return molecule_data, protein_data
