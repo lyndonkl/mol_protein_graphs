@@ -38,6 +38,7 @@ warnings.filterwarnings("ignore")
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12355'
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata):
@@ -53,7 +54,7 @@ class Trainer:
 
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=4,
+            batch_size=8,
             num_workers=2,
             shuffle=False,
             sampler=train_sampler,
@@ -76,22 +77,26 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.logger.info(f"[Rank {rank}] Optimizer initialized")
 
-        if rank == 0:
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=8,
-                num_workers=4,
-                shuffle=False,
-                collate_fn=collate_fn
-            )
-            
-            self.test_loader = DataLoader(
-                test_dataset,
-                batch_size=8,
-                num_workers=4,
-                shuffle=False,
-                collate_fn=collate_fn
-            )
+
+        self.val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=8,
+            num_workers=2,
+            shuffle=False,
+            sampler=self.val_sampler,
+            collate_fn=collate_fn
+        )
+
+        self.test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=8,
+            num_workers=2,
+            shuffle=False,
+            sampler=self.test_sampler,
+            collate_fn=collate_fn
+        )
         
         self.logger.info(f"[Rank {self.rank}] Train loader initialized with {len(self.train_loader)} batches")
 
@@ -154,15 +159,12 @@ class Trainer:
 
     def validate(self):
         try:
-            if self.rank != 0:
-                return None
-            
             self.logger.info(f"[Rank {self.rank}] Starting validation")
             self.model.eval()
             total_loss = 0
             total_samples = 0
             with torch.no_grad():
-                for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating"):
+                for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
                     mol_data = mol_data.to(DEVICE)
                     prot_data = prot_data.to(DEVICE)
                     out = self.model(mol_data, prot_data)
@@ -174,7 +176,22 @@ class Trainer:
 
             self.logger.info(f"[Rank {self.rank}] Finished validation")
 
-            return total_loss / total_samples
+            if DEVICE.type == 'cpu':
+                # Gather losses from all processes only if using CPU (multi-process)
+                all_losses = [torch.zeros(1).to(DEVICE) for _ in range(self.world_size)]
+                all_samples = [torch.zeros(1, dtype=torch.long).to(DEVICE) for _ in range(self.world_size)]
+                
+                dist.all_gather(all_losses, torch.tensor([total_loss]).to(DEVICE))
+                dist.all_gather(all_samples, torch.tensor([total_samples]).to(DEVICE))
+
+                total_loss = sum(loss.item() for loss in all_losses)
+                total_samples = sum(samples.item() for samples in all_samples)
+            else:
+                # For MPS, we're already using a single process, so no need to gather
+                pass
+
+            average_loss = total_loss / total_samples
+            return average_loss
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in validate: {e}")
             traceback.print_exc()
@@ -182,9 +199,7 @@ class Trainer:
 
     def test(self):
         try:
-            if self.rank != 0:
-                return None, None
-            
+            self.logger.info(f"[Rank {self.rank}] Starting testing")
             self.model.eval()
             predictions = []
             true_labels = []
@@ -198,7 +213,19 @@ class Trainer:
                     predictions.extend(out.cpu().numpy())
                     true_labels.extend(y.cpu().numpy())
 
-            return predictions, true_labels
+            self.logger.info(f"[Rank {self.rank}] Finished testing")
+
+            # Gather predictions and true labels from all processes
+            all_predictions = [torch.zeros_like(torch.tensor(predictions), device=DEVICE) for _ in range(self.world_size)]
+            all_true_labels = [torch.zeros_like(torch.tensor(true_labels), device=DEVICE) for _ in range(self.world_size)]
+
+            dist.all_gather(all_predictions, torch.tensor(predictions))
+            dist.all_gather(all_true_labels, torch.tensor(true_labels))
+
+            all_predictions = torch.cat(all_predictions, dim=0)
+            all_true_labels = torch.cat(all_true_labels, dim=0)
+
+            return all_predictions, all_true_labels
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in test: {e}")
             traceback.print_exc()
@@ -234,18 +261,18 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
         # Add barrier to synchronize all processes
         torch.distributed.barrier()
 
-        if rank == 0:
-            val_loss = trainer.validate()
-            logger.info(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        val_loss = trainer.validate()
+        logger.info(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
 
-            # Save the model if it's the best so far
+        # Save the model if it's the best so far
+        if rank == 0:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 # Save the model
-                torch.save(model.module.state_dict(), 'best_cross_graph_attention_model.pth')
+                torch.save(model.state_dict(), 'best_cross_graph_attention_model.pth')
                 logger.info(f'New best model saved at epoch {epoch}')
 
-            trainer.scheduler.step()
+        trainer.scheduler.step()
 
         # All processes wait here until validation is complete
         torch.distributed.barrier()

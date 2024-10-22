@@ -77,22 +77,21 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.logger.info(f"[Rank {rank}] Optimizer initialized")
 
-        if rank == 0:
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=64,
-                num_workers=30,
-                shuffle=False,
-                collate_fn=collate_fn
-            )
-            
-            self.test_loader = DataLoader(
-                test_dataset,
-                batch_size=64,
-                num_workers=30,
-                shuffle=False,
-                collate_fn=collate_fn
-            )
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=64,
+            num_workers=30,
+            shuffle=False,
+            collate_fn=collate_fn
+        )
+        
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=64,
+            num_workers=30,
+            shuffle=False,
+            collate_fn=collate_fn
+        )
         
         self.logger.info(f"[Rank {self.rank}] Train loader initialized with {len(self.train_loader)} batches")
 
@@ -103,8 +102,8 @@ class Trainer:
             self.train_loader.sampler.set_epoch(epoch)
 
             self.model.train()
-            total_loss = torch.zeros(1).to(self.rank)
-            total_samples = torch.zeros(1).to(self.rank)
+            total_loss = 0
+            total_samples = 0
             for mol_data, prot_data, batch_size in tqdm(self.train_loader, desc="Training", disable=(self.rank != 0)):
                 self.optimizer.zero_grad()
                 mol_data = mol_data.to(self.rank)
@@ -116,7 +115,7 @@ class Trainer:
                 loss.backward()
                 self.optimizer.step()
 
-                total_loss += loss.item() * batch_size
+                total_loss += (loss.item() * batch_size)
                 total_samples += batch_size
 
                 if batch_size % 100 == 0:
@@ -124,12 +123,16 @@ class Trainer:
 
             self.logger.info(f"[Rank {self.rank}] Finished training epoch {epoch}")
 
+            # Convert total_loss and total_samples to tensors
+            loss_data = torch.tensor([total_loss], device=self.rank)
+            samples_data = torch.tensor([total_samples], device=self.rank)
+
             # Perform all_reduce on total_loss and total_samples
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
+            dist.all_reduce(loss_data, op=dist.ReduceOp.SUM)
+            dist.all_reduce(samples_data, op=dist.ReduceOp.SUM)
             self.logger.info(f"[Rank {self.rank}] Completed dist.all_reduce in epoch {epoch}")
 
-            average_loss = total_loss.item() / total_samples.item()
+            average_loss = loss_data.item() / samples_data.item()
             return average_loss
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in train_epoch: {e}")
@@ -138,27 +141,34 @@ class Trainer:
 
     def validate(self):
         try:
-            if self.rank != 0:
-                return None
-            
             self.logger.info(f"[Rank {self.rank}] Starting validation")
             self.model.eval()
             total_loss = 0
             total_samples = 0
             with torch.no_grad():
-                for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating"):
+                for mol_data, prot_data, batch_size in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
                     mol_data = mol_data.to(self.rank)
                     prot_data = prot_data.to(self.rank)
                     out = self.model(mol_data, prot_data)
                     y = mol_data['smolecule'].y.to(self.rank)
 
                     loss = self.criterion(out, y)
-                    total_loss += loss.item() * batch_size
+                    total_loss += (loss.item() * batch_size)
                     total_samples += batch_size
 
             self.logger.info(f"[Rank {self.rank}] Finished validation")
 
-            return total_loss / total_samples
+            # Convert total_loss and total_samples to tensors
+            loss_data = torch.tensor([total_loss], device=self.rank)
+            samples_data = torch.tensor([total_samples], device=self.rank)
+
+            # Perform all_reduce on total_loss and total_samples
+            dist.all_reduce(loss_data, op=dist.ReduceOp.SUM)
+            dist.all_reduce(samples_data, op=dist.ReduceOp.SUM)
+            self.logger.info(f"[Rank {self.rank}] Completed dist.all_reduce in epoch {epoch}")
+
+            average_loss = loss_data.item() / samples_data.item()
+            return average_loss
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in validate: {e}")
             traceback.print_exc()
@@ -166,24 +176,34 @@ class Trainer:
 
     def test(self):
         try:
-            if self.rank != 0:
-                return None, None
-            
             self.model.eval()
             predictions = []
             true_labels = []
+            total_samples = 0
             with torch.no_grad():
-                for mol_data, prot_data, batch_size in tqdm(self.test_loader, desc="Testing"):
+            for mol_data, prot_data, batch_size in tqdm(self.test_loader, desc="Testing", disable=(self.rank != 0)):
                     mol_data = mol_data.to(self.rank)
                     prot_data = prot_data.to(self.rank)
                     out = self.model(mol_data, prot_data)
                     y = mol_data['smolecule'].y.to(self.rank)
 
-
                     predictions.extend(out.cpu().numpy())
                     true_labels.extend(y.cpu().numpy())
+                    total_samples += batch_size
 
-            return predictions, true_labels
+
+            self.logger.info(f"[Rank {self.rank}] Finished testing")
+            # Gather predictions and true labels from all processes
+            all_predictions = [torch.zeros_like(torch.tensor(predictions)) for _ in range(self.world_size)]
+            all_true_labels = [torch.zeros_like(torch.tensor(true_labels)) for _ in range(self.world_size)]
+
+            dist.all_gather(all_predictions, torch.tensor(predictions))
+            dist.all_gather(all_true_labels, torch.tensor(true_labels))
+
+            all_predictions = torch.cat(all_predictions, dim=0)
+            all_true_labels = torch.cat(all_true_labels, dim=0)
+
+            return all_predictions, all_true_labels
         except Exception as e:
             self.logger.error(f"[Rank {self.rank}] Error in test: {e}")
             traceback.print_exc()
@@ -217,16 +237,15 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
         # Add barrier to synchronize all processes
         torch.distributed.barrier()
 
-        if rank == 0:
-            val_loss = trainer.validate()
-            logger.info(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        val_loss = trainer.validate()
+        logger.info(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
 
-            # Save the model if it's the best so far
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                # Save the model
-                torch.save(model.module.state_dict(), 'best_cross_graph_attention_model.pth')
-                logger.info(f'New best model saved at epoch {epoch}')
+        # Save the model if it's the best so far
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # Save the model
+            torch.save(model.module.state_dict(), 'best_cross_graph_attention_model.pth')
+            logger.info(f'New best model saved at epoch {epoch}')
 
         # All processes wait here until validation is complete
         torch.distributed.barrier()
