@@ -50,7 +50,7 @@ class Trainer:
         self.model = model
 
         # Create a DistributedSampler for the training data
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=self.rank, shuffle=True)
 
         self.train_loader = DataLoader(
             train_dataset,
@@ -63,7 +63,14 @@ class Trainer:
 
         # Ensure model is on the correct device before performing the dummy forward pass
         self.model = self.model.to(DEVICE)
-        self.logger.info(f"[Rank {rank}] Model moved to device {DEVICE}")
+        self.logger.info(f"[Rank {rank}] Model moved to device {self.rank}")
+
+        # Load existing model weights if available
+        model_path = 'best_cross_graph_attention_model.pth'
+        if os.path.exists(model_path):
+            self.logger.info(f"[Rank {rank}] Loading existing model weights from {model_path}")
+            self.model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+
 
         try:
             self.model = DistributedDataParallel(self.model, device_ids=None, find_unused_parameters=True)
