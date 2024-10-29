@@ -112,7 +112,7 @@ class TripletTrainer:
             accumulation_steps = 16
             self.optimizer.zero_grad()
 
-            for i, (anchor, positive, negative, protein_type_id) in enumerate(tqdm(self.train_loader, desc="Training", disable=(self.rank != 0))):
+            for i, (anchor, positive, negative, protein_type_id, batch_size) in enumerate(tqdm(self.train_loader, desc="Training", disable=(self.rank != 0))):
                 anchor = anchor.to(DEVICE)
                 positive = positive.to(DEVICE)
                 negative = negative.to(DEVICE)
@@ -125,7 +125,7 @@ class TripletTrainer:
                 loss = self.criterion(anchor_out, positive_out, negative_out)
                 loss = loss / accumulation_steps
                 loss.backward()
-                accumulated_loss += loss.item() * anchor.num_graphs
+                accumulated_loss += loss.item() * batch_size
 
                 if (i + 1) % accumulation_steps == 0 or (i + 1) == len(self.train_loader):
                     self.optimizer.step()
@@ -133,7 +133,7 @@ class TripletTrainer:
                     total_loss += accumulated_loss
                     accumulated_loss = 0.0
 
-                total_samples += anchor.num_graphs
+                total_samples += batch_size
 
             self.logger.info(f"[Rank {self.rank}] Finished training epoch {epoch}")
 
@@ -160,7 +160,7 @@ class TripletTrainer:
             total_loss = 0
             total_samples = 0
             with torch.no_grad():
-                for anchor, positive, negative, protein_type_id in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
+                for anchor, positive, negative, protein_type_id, batch_size in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
                     anchor = anchor.to(DEVICE)
                     positive = positive.to(DEVICE)
                     negative = negative.to(DEVICE)
@@ -171,8 +171,8 @@ class TripletTrainer:
                     negative_out = self.model(negative, protein_type_id)
 
                     loss = self.criterion(anchor_out, positive_out, negative_out)
-                    total_loss += loss.item() * anchor.num_graphs
-                    total_samples += anchor.num_graphs
+                    total_loss += loss.item() * batch_size
+                    total_samples += batch_size
 
             self.logger.info(f"[Rank {self.rank}] Finished validation")
 
@@ -205,7 +205,7 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     logger.info(f"[Rank {rank}] Process group initialized with backend {backend}")
 
-    model = StackedMoleculeGraphTripletModel(3, graph_metadata, hidden_dim=128, num_attention_heads=8, num_layers=4)
+    model = StackedMoleculeGraphTripletModel(3, graph_metadata, hidden_dim=256, num_attention_heads=16, num_layers=3)
     logger.info(f"[Rank {rank}] Model initialized")
 
     trainer = TripletTrainer(model, train_dataset, val_dataset, test_dataset, rank, world_size, graph_metadata)

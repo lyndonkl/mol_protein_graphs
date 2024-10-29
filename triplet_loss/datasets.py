@@ -37,7 +37,8 @@ class MoleculeDataset(Dataset):
         # Add metadata
         for graph in [anchor, positive, negative]:
             graph['smolecule'].protein_name = protein_name
-            graph['smolecule'].id = torch.tensor([molecule_id], dtype=torch.long)
+            # Store molecule_id as a string to avoid overflow issues
+            graph['smolecule'].id = str(molecule_id)
 
         return anchor, positive, negative
 
@@ -286,5 +287,8 @@ class CombinedDataset(Dataset):
             return None
 
         protein_type_id = self.protein_mapping[protein_name]
+
+        # Convert protein_type_id to a tensor
+        protein_type_id = torch.tensor([protein_type_id], dtype=torch.long)
 
         return anchor, positive, negative, protein_type_id

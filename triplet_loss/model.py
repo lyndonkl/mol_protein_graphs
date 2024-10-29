@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool
+from torch_geometric.nn import HeteroConv, GINEConv, global_mean_pool
 from torch.nn import Linear
 
 # Custom imports
