@@ -1,8 +1,6 @@
 import os
 import logging
-from itertools import cycle
 import pandas as pd
-import numpy as np
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import pyarrow.parquet as pq
@@ -10,13 +8,12 @@ import pyarrow as pa
 from rdkit import Chem
 from rdkit.Chem import AllChem
 import concurrent.futures
-from functools import partial
 import random
 
 class Preprocessor:
     def __init__(self, input_file, output_dir):
-        self.input_file = input_file
-        self.output_dir = output_dir
+        self.input_file = os.path.join("../../data", input_file)
+        self.output_dir = os.path.join("../../data", output_dir)
         self.proteins = ['HSA', 'sEH', 'BRD4']
         
         # Set up logging

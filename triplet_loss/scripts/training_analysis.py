@@ -1,5 +1,4 @@
 import time
-import os
 import json
 import random
 import matplotlib.pyplot as plt
@@ -12,9 +11,9 @@ from tqdm import tqdm
 import warnings
 
 # Custom imports
-from datasets import CombinedDataset
-from model import StackedMoleculeGraphTripletModel
-from utils import setup_logger, collate_fn
+from triplet_loss.src.data.datasets import CombinedDataset
+from triplet_loss.src.model.model import StackedMoleculeGraphTripletModel
+from triplet_loss.src.utils.helpers import setup_logger, collate_fn
 
 # Constants
 RANDOM_SEED = 42
@@ -83,7 +82,7 @@ def determine_dataset_size(dataset, batch_size, model, optimizer, criterion, max
     plt.xlabel('Dataset Size')
     plt.ylabel('Training Time (minutes)')
     plt.title('Dataset Size vs Training Time')
-    plt.savefig('dataset_size_vs_training_time.png')
+    plt.savefig('data/dataset_size_vs_training_time.png')
     plt.close()
     
     # Return the maximum dataset size that completes in under max_time_minutes
@@ -165,7 +164,7 @@ def main():
     logger = setup_logger()
     
     # Load data
-    df = pd.read_parquet('cleaned_train_unique.parquet')
+    df = pd.read_parquet('triplet_loss/data/cleaned_train_unique.parquet')
     train_df, temp_df = train_test_split(df, test_size=0.3, random_state=RANDOM_SEED)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=RANDOM_SEED)
 
@@ -174,7 +173,7 @@ def main():
     logger.info(f"Test set size: {len(test_df)}")
 
     # Load graph metadata
-    with open('unique_atom_and_edge_types.json', 'r') as f:
+    with open('triplet_loss/data/unique_atom_and_edge_types.json', 'r') as f:
         unique_types = json.load(f)
 
     molecule_node_types = unique_types['molecule_node_types']
