@@ -30,7 +30,7 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 class TripletTrainer:
-    def __init__(self, model, train_dataset, val_dataset, rank, world_size):
+    def __init__(self, model, train_dataset, val_dataset, rank, world_size, optimizer_params):
         self.logger = setup_logger()
         self.logger.info(f"[Rank {rank}] Initializing TripletTrainer")
 
@@ -66,7 +66,7 @@ class TripletTrainer:
             raise e
 
         self.criterion = torch.nn.TripletMarginLoss(margin=1.0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), **optimizer_params)
         self.logger.info(f"[Rank {rank}] Optimizer initialized")
 
         self.val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -95,17 +95,19 @@ class TripletTrainer:
             accumulation_steps = 16
             self.optimizer.zero_grad()
 
-            for i, (anchor, positive, negative, protein_type_id, batch_size) in enumerate(tqdm(self.train_loader, desc="Training", disable=(self.rank != 0))):
-                anchor = anchor.to(DEVICE)
-                positive = positive.to(DEVICE)
-                negative = negative.to(DEVICE)
-                protein_type_id = protein_type_id.to(DEVICE)
+            for i, (combined_data, combined_protein_id, batch_size, num_nodes) in enumerate(tqdm(self.train_loader, desc="Training", disable=(self.rank != 0))):
+                # Move data to the appropriate device
+                combined_data = combined_data.to(DEVICE)
+                combined_protein_id = combined_protein_id.to(DEVICE)
 
-                anchor_out = self.model(anchor, protein_type_id)
-                positive_out = self.model(positive, protein_type_id)
-                negative_out = self.model(negative, protein_type_id)
+                # Forward pass for the combined batch
+                outputs = self.model(combined_data, combined_protein_id)
 
-                loss = self.criterion(anchor_out, positive_out, negative_out)
+                # Split the outputs into anchor, positive, and negative
+                anchor_output, positive_output, negative_output = torch.split(outputs, num_nodes)
+
+                # Compute triplet loss using the criterion
+                loss = self.criterion(anchor_output, positive_output, negative_output)
                 loss = loss / accumulation_steps
                 loss.backward()
                 accumulated_loss += loss.item() * batch_size
@@ -143,17 +145,19 @@ class TripletTrainer:
             total_loss = 0
             total_samples = 0
             with torch.no_grad():
-                for anchor, positive, negative, protein_type_id, batch_size in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
-                    anchor = anchor.to(DEVICE)
-                    positive = positive.to(DEVICE)
-                    negative = negative.to(DEVICE)
-                    protein_type_id = protein_type_id.to(DEVICE)
+                for combined_data, combined_protein_id, batch_size, num_nodes in tqdm(self.val_loader, desc="Validating", disable=(self.rank != 0)):
+                    # Move data to the appropriate device
+                    combined_data = combined_data.to(DEVICE)
+                    combined_protein_id = combined_protein_id.to(DEVICE)
 
-                    anchor_out = self.model(anchor, protein_type_id)
-                    positive_out = self.model(positive, protein_type_id)
-                    negative_out = self.model(negative, protein_type_id)
+                    # Forward pass for the combined batch
+                    outputs = self.model(combined_data, combined_protein_id)
 
-                    loss = self.criterion(anchor_out, positive_out, negative_out)
+                    # Split the outputs into anchor, positive, and negative
+                    anchor_output, positive_output, negative_output = torch.split(outputs, num_nodes)
+
+                    # Compute triplet loss using the criterion
+                    loss = self.criterion(anchor_output, positive_output, negative_output)
                     total_loss += loss.item() * batch_size
                     total_samples += batch_size
 

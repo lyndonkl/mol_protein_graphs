@@ -41,17 +41,19 @@ def determine_dataset_size(dataset, batch_size, model, optimizer, criterion, max
         # Measure training time for one epoch
         model.train()
         start_time = time.time()
-        for anchor, positive, negative, protein_type_id, _ in tqdm(dataloader, desc="Training", leave=False):
-            anchor = anchor.to(DEVICE)
-            positive = positive.to(DEVICE)
-            negative = negative.to(DEVICE)
-            protein_type_id = protein_type_id.to(DEVICE)
+        for combined_data, combined_protein_id, batch_size, num_nodes  in tqdm(dataloader, desc="Training", leave=False):
+            # Move data to the appropriate device
+            combined_data = combined_data.to(DEVICE)
+            combined_protein_id = combined_protein_id.to(DEVICE)
 
-            anchor_out = model(anchor, protein_type_id)
-            positive_out = model(positive, protein_type_id)
-            negative_out = model(negative, protein_type_id)
+            # Forward pass for the combined batch
+            outputs = model(combined_data, combined_protein_id)
 
-            loss = criterion(anchor_out, positive_out, negative_out)
+            # Split the outputs into anchor, positive, and negative
+            anchor_output, positive_output, negative_output = torch.split(outputs, num_nodes)
+
+            # Compute triplet loss using the criterion
+            loss = criterion(anchor_output, positive_output, negative_output)
             
             optimizer.zero_grad()
             loss.backward()
@@ -149,7 +151,11 @@ def run_grid_search(dataset, model_class, param_grid, batch_size, max_dataset_si
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_params = params
+            best_params = {
+                **params,
+                'lr': optimizer_params['lr'],
+                'weight_decay': optimizer_params['weight_decay']
+            }
     
     logger.info(f"Best hyperparameters: {best_params}")
     logger.info(f"Best loss: {best_loss}")

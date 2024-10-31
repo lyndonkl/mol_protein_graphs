@@ -29,6 +29,11 @@ def collate_fn(batch):
     positive_batch = Batch.from_data_list(positives)
     negative_batch = Batch.from_data_list(negatives)
 
-    batch_size = len(valid_items)
+    num_items = len(valid_items)
+    batch_size = num_items * 3
 
-    return anchor_batch, positive_batch, negative_batch, protein_type_ids, batch_size
+    # Stack anchor, positive, and negative, and repeat protein_type_ids
+    combined_data = Batch.from_data_list(anchors + positives + negatives)
+    combined_protein_id = torch.cat([protein_type_ids, protein_type_ids, protein_type_ids], dim=0)
+
+    return combined_data, combined_protein_id, batch_size, num_items

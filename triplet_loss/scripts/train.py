@@ -37,11 +37,14 @@ def run(rank: int, world_size: int, train_dataset, val_dataset, test_dataset, gr
     model = StackedMoleculeGraphTripletModel(3, graph_metadata, hidden_dim=256, num_attention_heads=16, num_layers=3)
     model.train()  # Make sure model is in training mode
     
-    # Enable gradient checkpointing
-    
     logger.info(f"[Rank {rank}] Model initialized")
 
-    trainer = TripletTrainer(model, train_dataset, val_dataset, rank, world_size)
+    optimizer_params = {
+        'lr': 0.0001,
+        'weight_decay': 0.001
+    }
+
+    trainer = TripletTrainer(model, train_dataset, val_dataset, rank, world_size, optimizer_params)
 
     num_epochs = 5
     best_val_loss = float('inf')
