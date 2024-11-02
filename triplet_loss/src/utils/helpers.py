@@ -14,20 +14,24 @@ def setup_logger():
     logger.addHandler(handler)
     return logger
 
-def collate_fn(batch):
+def collate_fn(batch, predicting=False):
     """
     Collate function to process and combine batch items for triplet loss.
+    If predicting=True, returns only the first item (node) and protein_type_id.
+    Otherwise returns the full triplet data.
     """
     valid_items = [item for item in batch if item is not None]
+    
+    if predicting:
+        nodes = [item[0] for item in valid_items]
+        protein_type_ids = torch.cat([item[1] for item in valid_items])
+        combined_data = Batch.from_data_list(nodes)
+        return combined_data, protein_type_ids, len(valid_items), len(valid_items)
     
     anchors = [item[0] for item in valid_items]
     positives = [item[1] for item in valid_items]
     negatives = [item[2] for item in valid_items]
     protein_type_ids = torch.cat([item[3] for item in valid_items])
-
-    anchor_batch = Batch.from_data_list(anchors)
-    positive_batch = Batch.from_data_list(positives)
-    negative_batch = Batch.from_data_list(negatives)
 
     num_items = len(valid_items)
     batch_size = num_items * 3

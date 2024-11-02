@@ -22,13 +22,21 @@ class MoleculeDataset(Dataset):
     def len(self):
         return len(self.dataframe)
 
-    def get(self, idx):
+    def get(self, idx, predicting=False):
         row = self.dataframe.iloc[idx]
+        protein_name = row['protein_name']
+        molecule_id = row['id']
+
+        if predicting:
+            molecule_smiles = row['molecule_smiles']
+            node = self.create_molecule_graph(molecule_smiles)
+            node['smolecule'].protein_name = protein_name
+            node['smolecule'].id = str(molecule_id)
+            return node
+
         smiles_binds = row['smiles_binds']
         smiles_non_binds_1 = row['smiles_non_binds_1']
         smiles_non_binds_2 = row['smiles_non_binds_2']
-        protein_name = row['protein_name']
-        molecule_id = row['id']
 
         # Create three molecule graphs
         anchor = self.create_molecule_graph(smiles_non_binds_1)
