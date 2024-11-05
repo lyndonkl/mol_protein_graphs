@@ -69,7 +69,7 @@ def run(rank: int, world_size: int, val_dataset, test_dataset, graph_metadata):
         test_dataset=test_dataset,
         rank=rank,
         world_size=world_size,
-        batch_size=8,
+        batch_size=4,
         device=DEVICE
     )
     

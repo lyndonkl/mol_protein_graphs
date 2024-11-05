@@ -94,19 +94,21 @@ class TripletEvaluator:
         self.reference_path = 'reference_embeddings.pkl'
 
     def generate_reference_embeddings(self):
-        """Generate and save reference embeddings from validation set."""
+        """Generate and save reference embeddings iteratively."""
         if self.rank == 0:
             self.logger.info("Generating reference embeddings from validation set...")
-            
+            os.makedirs('reference_embeddings/temp', exist_ok=True)
+        
         self.model.eval()
         binding_embeddings_by_protein = {}
         non_binding_embeddings_by_protein = {}
         
+        # Keep track of saved parts for each protein
+        saved_parts = {}
+        
         with torch.no_grad():
-            for combined_data, combined_protein_id, _, num_nodes in tqdm(
-                self.val_loader,
-                desc="Generating embeddings",
-                disable=(self.rank != 0)
+            for batch_idx, (combined_data, combined_protein_id, _, num_nodes) in enumerate(
+                tqdm(self.val_loader, desc="Generating embeddings", disable=(self.rank != 0))
             ):
                 # Process batch
                 combined_data = combined_data.to(self.device)
@@ -116,11 +118,10 @@ class TripletEvaluator:
                 # Split triplets
                 anchor_emb, positive_emb, negative_emb = torch.split(outputs, num_nodes)
                 anchor_protein_id, positive_protein_id, negative_protein_id = torch.split(
-                    combined_protein_id, 
-                    num_nodes
+                    combined_protein_id, num_nodes
                 )
                 
-                # Process each protein type
+                # Process each protein type in batch
                 for prot_type in combined_protein_id.unique():
                     prot_id = prot_type.item()
                     
@@ -139,51 +140,206 @@ class TripletEvaluator:
                             target_list = (binding_embeddings_by_protein if is_binding 
                                          else non_binding_embeddings_by_protein)[prot_id]
                             target_list.append(emb[mask])
+                
+                # Periodically gather and save embeddings
+                if (batch_idx + 1) % 200 == 0:
+                    for prot_id in binding_embeddings_by_protein:
+                        if binding_embeddings_by_protein[prot_id]:
+                            try:
+                                # Each rank calculates its local sizes
+                                binding_size = torch.tensor([t.size(0) for t in binding_embeddings_by_protein[prot_id]]).sum()
+                                non_binding_size = torch.tensor([t.size(0) for t in non_binding_embeddings_by_protein[prot_id]]).sum()
+                                
+                                # Share size with rank 0
+                                if self.rank == 0:
+                                    all_binding_sizes = [binding_size.item()]
+                                    all_non_binding_sizes = [non_binding_size.item()]
+                                    for i in range(1, self.world_size):
+                                        size_tensor = torch.zeros_like(binding_size)
+                                        dist.recv(size_tensor, src=i)
+                                        all_binding_sizes.append(size_tensor.item())
+                                        
+                                        size_tensor = torch.zeros_like(non_binding_size)
+                                        dist.recv(size_tensor, src=i)
+                                        all_non_binding_sizes.append(size_tensor.item())
+                                else:
+                                    dist.send(binding_size, dst=0)
+                                    dist.send(non_binding_size, dst=0)
+                                
+                                # Rank 0 checks sizes and broadcasts decision
+                                proceed = torch.zeros(1, dtype=torch.bool)
+                                if self.rank == 0:
+                                    # No need to convert to integers since we already did above
+                                    sizes_match = (len(set(all_binding_sizes)) == 1 and 
+                                                 len(set(all_non_binding_sizes)) == 1)
+                                    proceed[0] = sizes_match
+                                    if not sizes_match:
+                                        self.logger.warning(f"Size mismatch at batch {batch_idx} for protein {prot_id}: "
+                                                         f"binding={all_binding_sizes}, "
+                                                         f"non_binding={all_non_binding_sizes}")
+                                
+                                # Broadcast decision to all ranks
+                                dist.broadcast(proceed, src=0)
+                                
+                                if proceed[0]:
+                                    binding_emb = torch.cat(binding_embeddings_by_protein[prot_id])
+                                    non_binding_emb = torch.cat(non_binding_embeddings_by_protein[prot_id])
+                                    
+                                    gathered_binding = [torch.zeros_like(binding_emb) for _ in range(self.world_size)]
+                                    gathered_non_binding = [torch.zeros_like(non_binding_emb) for _ in range(self.world_size)]
+                                    
+                                    dist.barrier()
+                                    dist.all_gather(gathered_binding, binding_emb)
+                                    dist.all_gather(gathered_non_binding, non_binding_emb)
+                                    dist.barrier()
+                                    
+                                    if self.rank == 0:
+                                        reference_data = {
+                                            'binding': torch.cat(gathered_binding).cpu().numpy(),
+                                            'non_binding': torch.cat(gathered_non_binding).cpu().numpy()
+                                        }
+                                        
+                                        part_filename = f'reference_embeddings_protein_{prot_id}_part_{batch_idx}.pkl'
+                                        temp_path = os.path.join('reference_embeddings/temp', part_filename)
+                                        with open(temp_path, 'wb') as f:
+                                            pickle.dump(reference_data, f)
+                                        
+                                        if prot_id not in saved_parts:
+                                            saved_parts[prot_id] = []
+                                        saved_parts[prot_id].append(temp_path)
+                                    
+                                    # Clean up
+                                    del gathered_binding, gathered_non_binding
+                                    del binding_emb, non_binding_emb
+                                
+                            except Exception as e:
+                                self.logger.error(f"[Rank {self.rank}] Failed to process protein {prot_id} "
+                                                f"at batch {batch_idx}: {str(e)}")
+                                continue
+                    
+                    binding_embeddings_by_protein = {}
+                    non_binding_embeddings_by_protein = {}
+                    dist.barrier()
         
-        # Concatenate embeddings
+        # Process any remaining embeddings at the end
         for prot_id in binding_embeddings_by_protein:
-            binding_embeddings_by_protein[prot_id] = torch.cat(binding_embeddings_by_protein[prot_id])
-            non_binding_embeddings_by_protein[prot_id] = torch.cat(non_binding_embeddings_by_protein[prot_id])
+            if binding_embeddings_by_protein[prot_id]:
+                try:
+                    # Each rank calculates its local sizes
+                    binding_size = torch.tensor([t.size(0) for t in binding_embeddings_by_protein[prot_id]]).sum()
+                    non_binding_size = torch.tensor([t.size(0) for t in non_binding_embeddings_by_protein[prot_id]]).sum()
+                    
+                    # Share size with rank 0
+                    if self.rank == 0:
+                        all_binding_sizes = [binding_size.item()]
+                        all_non_binding_sizes = [non_binding_size.item()]
+                        for i in range(1, self.world_size):
+                            size_tensor = torch.zeros_like(binding_size)
+                            dist.recv(size_tensor, src=i)
+                            all_binding_sizes.append(size_tensor.item())
+                            
+                            size_tensor = torch.zeros_like(non_binding_size)
+                            dist.recv(size_tensor, src=i)
+                            all_non_binding_sizes.append(size_tensor.item())
+                    else:
+                        dist.send(binding_size, dst=0)
+                        dist.send(non_binding_size, dst=0)
+                    
+                    # Rank 0 checks sizes and broadcasts decision
+                    proceed = torch.zeros(1, dtype=torch.bool)
+                    if self.rank == 0:
+                        sizes_match = (len(set(all_binding_sizes)) == 1 and 
+                                     len(set(all_non_binding_sizes)) == 1)
+                        proceed[0] = sizes_match
+                        if not sizes_match:
+                            self.logger.warning(f"Size mismatch for final protein {prot_id}: "
+                                             f"binding={all_binding_sizes}, "
+                                             f"non_binding={all_non_binding_sizes}")
+                    
+                    # Broadcast decision to all ranks
+                    dist.broadcast(proceed, src=0)
+                    
+                    if proceed[0]:
+                        binding_emb = torch.cat(binding_embeddings_by_protein[prot_id])
+                        non_binding_emb = torch.cat(non_binding_embeddings_by_protein[prot_id])
+                        
+                        gathered_binding = [torch.zeros_like(binding_emb) for _ in range(self.world_size)]
+                        gathered_non_binding = [torch.zeros_like(non_binding_emb) for _ in range(self.world_size)]
+                        
+                        dist.barrier()
+                        dist.all_gather(gathered_binding, binding_emb)
+                        dist.all_gather(gathered_non_binding, non_binding_emb)
+                        dist.barrier()
+                        
+                        if self.rank == 0:
+                            reference_data = {
+                                'binding': torch.cat(gathered_binding).cpu().numpy(),
+                                'non_binding': torch.cat(gathered_non_binding).cpu().numpy()
+                            }
+                            
+                            part_filename = f'reference_embeddings_protein_{prot_id}_part_final.pkl'
+                            temp_path = os.path.join('reference_embeddings/temp', part_filename)
+                            with open(temp_path, 'wb') as f:
+                                pickle.dump(reference_data, f)
+                            
+                            if prot_id not in saved_parts:
+                                saved_parts[prot_id] = []
+                            saved_parts[prot_id].append(temp_path)
+                        
+                        # Clean up
+                        del gathered_binding, gathered_non_binding
+                        del binding_emb, non_binding_emb
+                    
+                except Exception as e:
+                    self.logger.error(f"[Rank {self.rank}] Failed to process final protein {prot_id}: {str(e)}")
+                    continue
+
+        binding_embeddings_by_protein = {}
+        non_binding_embeddings_by_protein = {}
+        dist.barrier()
         
-        # Gather embeddings from all processes
-        gathered_binding = {
-            prot_id: [torch.zeros_like(emb) for _ in range(self.world_size)]
-            for prot_id, emb in binding_embeddings_by_protein.items()
-        }
-        gathered_non_binding = {
-            prot_id: [torch.zeros_like(emb) for _ in range(self.world_size)]
-            for prot_id, emb in non_binding_embeddings_by_protein.items()
-        }
-        
-        for prot_id in binding_embeddings_by_protein:
-            dist.all_gather(gathered_binding[prot_id], binding_embeddings_by_protein[prot_id])
-            dist.all_gather(gathered_non_binding[prot_id], non_binding_embeddings_by_protein[prot_id])
-        
-        # Save reference embeddings (rank 0 only)
+        # Combine all parts into final files
         if self.rank == 0:
-            os.makedirs('reference_embeddings', exist_ok=True)
-            
-            for prot_id in binding_embeddings_by_protein:
-                reference_data = {
-                    'binding': torch.cat(gathered_binding[prot_id]).cpu().numpy(),
-                    'non_binding': torch.cat(gathered_non_binding[prot_id]).cpu().numpy()
+            self.logger.info("Combining partial embeddings into final files...")
+            for prot_id in saved_parts:
+                all_binding = []
+                all_non_binding = []
+                
+                # Load and combine all parts
+                for part_path in saved_parts[prot_id]:
+                    with open(part_path, 'rb') as f:
+                        part_data = pickle.load(f)
+                        all_binding.append(part_data['binding'])
+                        all_non_binding.append(part_data['non_binding'])
+                
+                # Save combined data
+                final_data = {
+                    'binding': np.concatenate(all_binding),
+                    'non_binding': np.concatenate(all_non_binding)
                 }
                 
-                reference_path = os.path.join('reference_embeddings', f'reference_embeddings_protein_{prot_id}.pkl')
-                with open(reference_path, 'wb') as f:
-                    pickle.dump(reference_data, f)
+                final_path = os.path.join('reference_embeddings', f'reference_embeddings_protein_{prot_id}.pkl')
+                with open(final_path, 'wb') as f:
+                    pickle.dump(final_data, f)
+                
+                # Clean up temp files
+                for part_path in saved_parts[prot_id]:
+                    os.remove(part_path)
             
             # Save manifest
             manifest = {
-                'protein_types': list(binding_embeddings_by_protein.keys()),
+                'protein_types': list(saved_parts.keys()),
                 'timestamp': datetime.datetime.now().isoformat()
             }
             with open(os.path.join('reference_embeddings', 'manifest.json'), 'w') as f:
                 json.dump(manifest, f, indent=4)
             
-            self.logger.info("Reference embeddings generated and saved by protein type.")
+            self.logger.info("Reference embeddings generation complete!")
+
+            # Remove temp directory
+            os.rmdir('reference_embeddings/temp')
         
-        dist.barrier()
+        dist.barrier()  # Final sync
 
     def load_reference_embeddings(self):
         """Load reference embeddings for each protein type from saved files."""
@@ -253,7 +409,10 @@ class TripletEvaluator:
         
         if not os.path.exists(self.reference_path):
             self.generate_reference_embeddings()
+            dist.barrier()
+        
         reference_embeddings = self.load_reference_embeddings()
+        dist.barrier()
         
         self.model.eval()
         all_predictions = []
