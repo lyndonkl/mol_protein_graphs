@@ -23,7 +23,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 # Custom imports
-from triplet_loss.src.utils.helpers import setup_logger, collate_fn
+from triplet_loss.src.utils.helpers import setup_logger, collate_fn, collate_fn_predict
 
 # Constants
 RANDOM_SEED = 42
@@ -84,14 +84,11 @@ class TripletEvaluator:
         loader_kwargs = {
             'batch_size': batch_size,
             'num_workers': 2,
-            'shuffle': False,
-            'collate_fn': collate_fn
+            'shuffle': False
         }
         
-        self.val_loader = DataLoader(val_dataset, sampler=self.val_sampler, **loader_kwargs)
-        self.test_loader = DataLoader(test_dataset, sampler=self.test_sampler, **loader_kwargs)
-        
-        self.reference_path = 'reference_embeddings.pkl'
+        self.val_loader = DataLoader(val_dataset, sampler=self.val_sampler, collate_fn=collate_fn, **loader_kwargs)
+        self.test_loader = DataLoader(test_dataset, sampler=self.test_sampler, collate_fn=collate_fn_predict, **loader_kwargs)
 
     def generate_reference_embeddings(self):
         """Generate and save reference embeddings iteratively."""
@@ -399,87 +396,257 @@ class TripletEvaluator:
 
     def predict(self):
         """
-        Generate binding predictions for test dataset.
+        Generate embeddings for test dataset and save them periodically.
         
         Returns:
-            numpy array: Predictions if rank is 0, None otherwise
+            None
         """
         if self.rank == 0:
-            self.logger.info("Starting evaluation...")
+            self.logger.info("Starting test embeddings generation...")
         
-        if not os.path.exists(self.reference_path):
+        # Check for reference embeddings and generate if missing
+        if not os.path.exists('reference_embeddings/manifest.json'):
             self.generate_reference_embeddings()
             dist.barrier()
         
-        reference_embeddings = self.load_reference_embeddings()
-        dist.barrier()
+        if self.rank == 0:
+            os.makedirs('test_embeddings/temp', exist_ok=True)
         
         self.model.eval()
-        all_predictions = []
-        all_mol_ids = []
-        all_embeddings = []
+        current_embeddings = []
+        current_mol_ids = []
+        current_protein_ids = []
+        saved_parts = []
         
         with torch.no_grad():
-            for node, protein_type_id in tqdm(
-                self.test_loader,
-                desc="Evaluating",
-                disable=(self.rank != 0)
+            for batch_idx, (node, protein_type_id, _, _) in enumerate(
+                tqdm(self.test_loader, desc="Generating embeddings", disable=(self.rank != 0))
             ):
                 node = node.to(self.device)
                 protein_type_id = protein_type_id.to(self.device)
                 batch_emb = self.model(node, protein_type_id)
                 
-                # Process predictions by protein type
-                for prot_id in protein_type_id.unique():
-                    mask = protein_type_id == prot_id
-                    if mask.any():
-                        prot_emb = batch_emb[mask]
-                        preds = self.predict_binding_batch(prot_emb, reference_embeddings[prot_id.item()])
-                        all_predictions.extend(preds)
-                        all_embeddings.extend(prot_emb.cpu().numpy())
+                # Get molecule IDs and protein IDs
+                mol_ids = [node['smolecule'].id[i] for i in range(len(node['smolecule'].id))]
+                protein_ids = protein_type_id.cpu().tolist()
+                
+                # Store embeddings, IDs, and protein types
+                current_embeddings.extend(batch_emb.cpu().numpy())
+                current_mol_ids.extend(mol_ids)
+                current_protein_ids.extend(protein_ids)
+                
+                # Save every 200 batches
+                if (batch_idx + 1) % 200 == 0:
+                    try:
+                        # Each rank calculates its local sizes
+                        embeddings_size = torch.tensor([len(current_embeddings)])
+                        mol_ids_size = torch.tensor([len(current_mol_ids)])
+                        protein_ids_size = torch.tensor([len(current_protein_ids)])
                         
-                        mol_ids = [node[i]['smolecule'].id for i in range(len(node)) if mask[i]]
-                        all_mol_ids.extend(mol_ids)
+                        # Share sizes with rank 0
+                        if self.rank == 0:
+                            all_embeddings_sizes = [embeddings_size.item()]
+                            all_mol_ids_sizes = [mol_ids_size.item()]
+                            all_protein_ids_sizes = [protein_ids_size.item()]
+                            for i in range(1, self.world_size):
+                                size_tensor = torch.zeros_like(embeddings_size)
+                                dist.recv(size_tensor, src=i)
+                                all_embeddings_sizes.append(size_tensor.item())
+                                
+                                size_tensor = torch.zeros_like(mol_ids_size)
+                                dist.recv(size_tensor, src=i)
+                                all_mol_ids_sizes.append(size_tensor.item())
+                                
+                                size_tensor = torch.zeros_like(protein_ids_size)
+                                dist.recv(size_tensor, src=i)
+                                all_protein_ids_sizes.append(size_tensor.item())
+                        else:
+                            dist.send(embeddings_size, dst=0)
+                            dist.send(mol_ids_size, dst=0)
+                            dist.send(protein_ids_size, dst=0)
+                        
+                        # Rank 0 checks sizes and broadcasts decision
+                        proceed = torch.zeros(1, dtype=torch.bool)
+                        if self.rank == 0:
+                            sizes_match = (len(set(all_embeddings_sizes)) == 1 and 
+                                         len(set(all_mol_ids_sizes)) == 1 and
+                                         len(set(all_protein_ids_sizes)) == 1 and
+                                         all_embeddings_sizes[0] == all_mol_ids_sizes[0] == all_protein_ids_sizes[0])
+                            proceed[0] = sizes_match
+                            if not sizes_match:
+                                self.logger.warning(f"Size mismatch at batch {batch_idx}: "
+                                                 f"embeddings={all_embeddings_sizes}, "
+                                                 f"mol_ids={all_mol_ids_sizes}, "
+                                                 f"protein_ids={all_protein_ids_sizes}")
+                        
+                        # Broadcast decision to all ranks
+                        dist.broadcast(proceed, src=0)
+                        
+                        if proceed[0]:
+                            embeddings = torch.tensor(current_embeddings, device=self.device)
+                            molecule_ids = torch.tensor([int(mid) for mid in current_mol_ids], device=self.device)
+                            protein_ids = torch.tensor(current_protein_ids, device=self.device)
+                            
+                            gathered_embeddings = [torch.zeros_like(embeddings) for _ in range(self.world_size)]
+                            gathered_ids = [torch.zeros_like(molecule_ids) for _ in range(self.world_size)]
+                            gathered_protein_ids = [torch.zeros_like(protein_ids) for _ in range(self.world_size)]
+                            
+                            dist.barrier()
+                            dist.all_gather(gathered_embeddings, embeddings)
+                            dist.all_gather(gathered_ids, molecule_ids)
+                            dist.all_gather(gathered_protein_ids, protein_ids)
+                            dist.barrier()
+                            
+                            if self.rank == 0:
+                                all_embeddings = torch.cat(gathered_embeddings).cpu().numpy()
+                                all_molecule_ids = torch.cat(gathered_ids).cpu().numpy()
+                                all_protein_ids = torch.cat(gathered_protein_ids).cpu().numpy()
+                                
+                                # Save part
+                                part_filename = f'test_embeddings_part_{batch_idx}.pkl'
+                                temp_path = os.path.join('test_embeddings/temp', part_filename)
+                                with open(temp_path, 'wb') as f:
+                                    pickle.dump({
+                                        'embeddings': all_embeddings,
+                                        'molecule_ids': all_molecule_ids,
+                                        'protein_ids': all_protein_ids
+                                    }, f)
+                                saved_parts.append(temp_path)
+                            
+                            # Clean up
+                            del gathered_embeddings, gathered_ids, gathered_protein_ids
+                            del embeddings, molecule_ids, protein_ids
+                        
+                        # Clear current batch data
+                        current_embeddings = []
+                        current_mol_ids = []
+                        current_protein_ids = []
+                        
+                    except Exception as e:
+                        self.logger.error(f"[Rank {self.rank}] Failed to process batch {batch_idx}: {str(e)}")
+                        continue
+                    
+                    dist.barrier()
         
-        # Gather predictions and embeddings from all processes
-        predicted_probs = torch.tensor(all_predictions, device=self.device)
-        molecule_ids = torch.tensor([int(mid) for mid in all_mol_ids], device=self.device)
-        embeddings = torch.tensor(all_embeddings, device=self.device)
-        
-        gathered_probs = [torch.zeros_like(predicted_probs) for _ in range(self.world_size)]
-        gathered_ids = [torch.zeros_like(molecule_ids) for _ in range(self.world_size)]
-        gathered_embeddings = [torch.zeros_like(embeddings) for _ in range(self.world_size)]
-        
-        dist.all_gather(gathered_probs, predicted_probs)
-        dist.all_gather(gathered_ids, molecule_ids)
-        dist.all_gather(gathered_embeddings, embeddings)
-        
-        # Save results (rank 0 only)
-        if self.rank == 0:
-            all_predicted_probs = torch.cat(gathered_probs).cpu().numpy()
-            all_molecule_ids = torch.cat(gathered_ids).cpu().numpy()
-            all_embeddings = torch.cat(gathered_embeddings).cpu().numpy()
+        # Process remaining embeddings
+        if current_embeddings:
+            try:
+                # Each rank calculates its local sizes
+                embeddings_size = torch.tensor([len(current_embeddings)])
+                mol_ids_size = torch.tensor([len(current_mol_ids)])
+                protein_ids_size = torch.tensor([len(current_protein_ids)])
+                
+                # Share sizes with rank 0
+                if self.rank == 0:
+                    all_embeddings_sizes = [embeddings_size.item()]
+                    all_mol_ids_sizes = [mol_ids_size.item()]
+                    all_protein_ids_sizes = [protein_ids_size.item()]
+                    for i in range(1, self.world_size):
+                        size_tensor = torch.zeros_like(embeddings_size)
+                        dist.recv(size_tensor, src=i)
+                        all_embeddings_sizes.append(size_tensor.item())
+                        
+                        size_tensor = torch.zeros_like(mol_ids_size)
+                        dist.recv(size_tensor, src=i)
+                        all_mol_ids_sizes.append(size_tensor.item())
+                        
+                        size_tensor = torch.zeros_like(protein_ids_size)
+                        dist.recv(size_tensor, src=i)
+                        all_protein_ids_sizes.append(size_tensor.item())
+                else:
+                    dist.send(embeddings_size, dst=0)
+                    dist.send(mol_ids_size, dst=0)
+                    dist.send(protein_ids_size, dst=0)
+                
+                # Rank 0 checks sizes and broadcasts decision
+                proceed = torch.zeros(1, dtype=torch.bool)
+                if self.rank == 0:
+                    sizes_match = (len(set(all_embeddings_sizes)) == 1 and 
+                                 len(set(all_mol_ids_sizes)) == 1 and
+                                 len(set(all_protein_ids_sizes)) == 1 and
+                                 all_embeddings_sizes[0] == all_mol_ids_sizes[0] == all_protein_ids_sizes[0])
+                    proceed[0] = sizes_match
+                    if not sizes_match:
+                        self.logger.warning(f"Size mismatch for final batch: "
+                                         f"embeddings={all_embeddings_sizes}, "
+                                         f"mol_ids={all_mol_ids_sizes}, "
+                                         f"protein_ids={all_protein_ids_sizes}")
+                
+                # Broadcast decision to all ranks
+                dist.broadcast(proceed, src=0)
+                
+                if proceed[0]:
+                    embeddings = torch.tensor(current_embeddings, device=self.device)
+                    molecule_ids = torch.tensor([int(mid) for mid in current_mol_ids], device=self.device)
+                    protein_ids = torch.tensor(current_protein_ids, device=self.device)
+                    
+                    gathered_embeddings = [torch.zeros_like(embeddings) for _ in range(self.world_size)]
+                    gathered_ids = [torch.zeros_like(molecule_ids) for _ in range(self.world_size)]
+                    gathered_protein_ids = [torch.zeros_like(protein_ids) for _ in range(self.world_size)]
+                    
+                    dist.barrier()
+                    dist.all_gather(gathered_embeddings, embeddings)
+                    dist.all_gather(gathered_ids, molecule_ids)
+                    dist.all_gather(gathered_protein_ids, protein_ids)
+                    dist.barrier()
+                    
+                    if self.rank == 0:
+                        all_embeddings = torch.cat(gathered_embeddings).cpu().numpy()
+                        all_molecule_ids = torch.cat(gathered_ids).cpu().numpy()
+                        all_protein_ids = torch.cat(gathered_protein_ids).cpu().numpy()
+                        
+                        part_filename = 'test_embeddings_part_final.pkl'
+                        temp_path = os.path.join('test_embeddings/temp', part_filename)
+                        with open(temp_path, 'wb') as f:
+                            pickle.dump({
+                                'embeddings': all_embeddings,
+                                'molecule_ids': all_molecule_ids,
+                                'protein_ids': all_protein_ids
+                            }, f)
+                        saved_parts.append(temp_path)
+                    
+                    # Clean up
+                    del gathered_embeddings, gathered_ids, gathered_protein_ids
+                    del embeddings, molecule_ids, protein_ids
             
-            # Save predictions
-            results_df = pd.DataFrame({
-                'id': all_molecule_ids,
-                'binds': all_predicted_probs
-            })
-            
-            os.makedirs('results', exist_ok=True)
-            output_path = os.path.join('results', 'binding_predictions.csv')
-            results_df.to_csv(output_path, index=False)
-            self.logger.info(f"Predictions saved to {output_path}")
-            
-            # Save embeddings
-            embeddings_df = pd.DataFrame({
-                'id': all_molecule_ids,
-                'embeddings': [emb.tolist() for emb in all_embeddings]
-            })
-            
-            embeddings_path = os.path.join('results', 'test_molecule_embeddings.csv')
-            embeddings_df.to_csv(embeddings_path, index=False)
-            self.logger.info(f"Embeddings saved to {embeddings_path}")
+            except Exception as e:
+                self.logger.error(f"[Rank {self.rank}] Failed to process final batch: {str(e)}")
         
         dist.barrier()
-        return all_predicted_probs if self.rank == 0 else None
+        
+        # Combine all parts into final file
+        if self.rank == 0:
+            self.logger.info("Combining partial embeddings into final file...")
+            all_embeddings = []
+            all_molecule_ids = []
+            all_protein_ids = []
+            
+            # Load and combine all parts
+            for part_path in saved_parts:
+                with open(part_path, 'rb') as f:
+                    part_data = pickle.load(f)
+                    all_embeddings.append(part_data['embeddings'])
+                    all_molecule_ids.append(part_data['molecule_ids'])
+                    all_protein_ids.append(part_data['protein_ids'])
+            
+            # Save combined data
+            final_data = {
+                'embeddings': np.concatenate(all_embeddings),
+                'molecule_ids': np.concatenate(all_molecule_ids),
+                'protein_ids': np.concatenate(all_protein_ids),
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            
+            os.makedirs('test_embeddings', exist_ok=True)
+            final_path = os.path.join('test_embeddings', 'test_embeddings.pkl')
+            with open(final_path, 'wb') as f:
+                pickle.dump(final_data, f)
+            
+            # Clean up temp files
+            for part_path in saved_parts:
+                os.remove(part_path)
+            os.rmdir('test_embeddings/temp')
+            
+            self.logger.info(f"Test embeddings saved to {final_path}")
+        
+        dist.barrier()
