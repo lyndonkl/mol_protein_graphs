@@ -645,8 +645,8 @@ class TripletEvaluator:
             # Clean up temp files
             for part_path in saved_parts:
                 os.remove(part_path)
-            os.rmdir('test_embeddings/temp')
             
             self.logger.info(f"Test embeddings saved to {final_path}")
+            os.rmdir('test_embeddings/temp')
         
         dist.barrier()

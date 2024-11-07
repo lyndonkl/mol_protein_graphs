@@ -1,292 +1,284 @@
 """
-Script to generate final binding predictions using protein-specific optimized 
-multi-level hierarchical clustering.
+Memory-efficient implementation of protein binding predictions using FAISS-based nearest neighbor search.
+
+This module provides functionality for generating protein binding predictions using FAISS-based
+nearest neighbor search with memory optimization techniques.
 """
 
-import os
-import math
-import time
-import sys
-import pickle
+# Standard library imports
+import gc
 import json
+import logging
+import os
+import pickle
+from concurrent.futures import ProcessPoolExecutor
+from typing import Dict
+
+# Third-party imports
 import numpy as np
 import pandas as pd
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import cdist
+import psutil
+import faiss
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-class TreeOptimizer:
-    @staticmethod
-    def calculate_tree_parameters(total_embeddings, target_leaf_size=100):
-        """Calculate optimal tree parameters based on dataset size."""
-        N = total_embeddings
-        L = target_leaf_size
-        
-        best_params = None
-        min_error = float('inf')
-        
-        for b in range(2, 51):
-            d = round(math.log(N/L, b))
-            expected_leaves = b**d
-            actual_leaf_size = N / expected_leaves
-            error = abs(actual_leaf_size - L)
-            
-            if error < min_error:
-                min_error = error
-                best_params = (d, b)
-        
-        return best_params
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-    @staticmethod
-    def get_leaf_sizes(hierarchy):
-        """Recursively get sizes of all leaf nodes in the hierarchy."""
-        if not hierarchy['children']:
-            return [len(hierarchy['embeddings'])]
-        
-        leaf_sizes = []
-        for child in hierarchy['children']:
-            leaf_sizes.extend(TreeOptimizer.get_leaf_sizes(child))
-        return leaf_sizes
 
+class MemoryTracker:
+    """Utility class for tracking memory usage during processing."""
+    
     @staticmethod
-    def benchmark_protein_parameters(embeddings, depths, branches, k_neighbors=5):
-        """Benchmark different tree configurations for a specific protein dataset."""
-        results = []
-        
-        for depth in depths:
-            for branch in branches:
-                # Create test hierarchy
-                hierarchy = {
-                    'embeddings': embeddings,
-                    'labels': np.zeros(len(embeddings)),  # Dummy labels for testing
-                    'children': [],
-                    'center': np.mean(embeddings, axis=0)
-                }
-                
-                # Time tree construction
-                start_time = time.time()
-                TreeOptimizer._build_test_hierarchy(hierarchy, depth=0, max_depth=depth, 
-                                                  branching_factor=branch)
-                build_time = time.time() - start_time
-                
-                # Get leaf statistics
-                leaf_sizes = TreeOptimizer.get_leaf_sizes(hierarchy)
-                
-                results.append({
-                    'depth': depth,
-                    'branching_factor': branch,
-                    'build_time': build_time,
-                    'avg_leaf_size': np.mean(leaf_sizes),
-                    'leaf_size_std': np.std(leaf_sizes),
-                    'num_leaves': len(leaf_sizes)
-                })
-        
-        return pd.DataFrame(results)
-
+    def get_memory_usage() -> float:
+        """Get current memory usage in GB."""
+        return psutil.Process().memory_info().rss / 1024 / 1024 / 1024
+    
     @staticmethod
-    def _build_test_hierarchy(node, depth, max_depth, branching_factor):
-        """Build test hierarchy for benchmarking."""
-        if depth >= max_depth or len(node['embeddings']) <= branching_factor:
-            return
-            
-        linkage_matrix = linkage(node['embeddings'], method='ward')
-        cluster_labels = fcluster(linkage_matrix, branching_factor, criterion='maxclust')
-        
-        for i in range(1, branching_factor + 1):
-            mask = cluster_labels == i
-            if not np.any(mask):
-                continue
-                
-            child = {
-                'embeddings': node['embeddings'][mask],
-                'labels': node['labels'][mask],
-                'children': [],
-                'center': np.mean(node['embeddings'][mask], axis=0)
-            }
-            node['children'].append(child)
-            
-            TreeOptimizer._build_test_hierarchy(child, depth + 1, max_depth, branching_factor)
+    def get_available_memory() -> float:
+        """Get available system memory in GB."""
+        return psutil.virtual_memory().available / 1024 / 1024 / 1024
+    
+    @staticmethod
+    def log_memory_usage(context: str):
+        """Log current memory usage with context."""
+        usage = MemoryTracker.get_memory_usage()
+        available = MemoryTracker.get_available_memory()
+        logger.info(f"Memory [{context}] - Used: {usage:.2f}GB, Available: {available:.2f}GB")
 
 class PredictionGenerator:
-    def __init__(self, reference_dir='reference_embeddings', test_dir='test_embeddings',
-                 output_dir='submissions', k_neighbors=5):
+    """
+    Main class for generating protein binding predictions using FAISS-based nearest neighbor search.
+    """
+    
+    def __init__(self, 
+                 reference_dir: str = 'reference_embeddings',
+                 test_dir: str = 'test_embeddings',
+                 output_dir: str = 'submissions',
+                 k_neighbors: int = 5,
+                 memory_threshold: float = 0.8,
+                 n_jobs: int = -1):
+        """
+        Initialize the PredictionGenerator.
+        
+        Args:
+            reference_dir: Directory containing reference embeddings
+            test_dir: Directory containing test embeddings
+            output_dir: Directory for output predictions
+            k_neighbors: Number of nearest neighbors to use
+            memory_threshold: Memory usage threshold for garbage collection
+            n_jobs: Number of parallel jobs (-1 for all cores)
+        """
         self.reference_dir = reference_dir
         self.test_dir = test_dir
         self.output_dir = output_dir
         self.k_neighbors = k_neighbors
+        self.memory_threshold = memory_threshold
+        self.n_jobs = n_jobs if n_jobs > 0 else os.cpu_count()
         
         # Load protein types from manifest
         manifest_path = os.path.join(reference_dir, 'manifest.json')
         with open(manifest_path, 'r') as f:
             self.protein_types = json.load(f)['protein_types']
         
-        # Store protein-specific parameters
-        self.protein_parameters = {}
-        self.reference_data = {}
+        self.indices = {}  # Store FAISS indices for each protein
+        
+        logger.info(f"Initialized PredictionGenerator with {len(self.protein_types)} protein types")
     
-    def _load_reference_data(self, protein_id):
-        """Load and combine reference embeddings for a protein."""
+    def _load_reference_data(self, protein_id: str) -> Dict[str, np.ndarray]:
+        """Load reference data with memory optimization."""
         ref_path = os.path.join(self.reference_dir, f'reference_embeddings_protein_{protein_id}.pkl')
-        with open(ref_path, 'rb') as f:
-            ref_data = pickle.load(f)
         
-        return {
-            'embeddings': np.concatenate([ref_data['binding'], ref_data['non_binding']]),
-            'labels': np.concatenate([
-                np.ones(len(ref_data['binding'])),
-                np.zeros(len(ref_data['non_binding']))
+        try:
+            with open(ref_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            binding_embeddings = np.array(data['binding'], dtype=np.float32)
+            non_binding_embeddings = np.array(data['non_binding'], dtype=np.float32)
+            
+            embeddings = np.vstack([binding_embeddings, non_binding_embeddings])
+            labels = np.concatenate([
+                np.ones(len(binding_embeddings), dtype=np.int8),
+                np.zeros(len(non_binding_embeddings), dtype=np.int8)
             ])
-        }
+            
+            logger.info(f"Loaded {len(binding_embeddings)} binding and {len(non_binding_embeddings)} "
+                       f"non-binding embeddings for protein {protein_id}")
+            
+            return {'embeddings': embeddings, 'labels': labels}
+            
+        except MemoryError:
+            logger.warning(f"Memory mapping fallback for protein {protein_id}")
+            return np.load(ref_path, mmap_mode='r')
     
-    def optimize_protein_parameters(self):
-        """Optimize tree parameters for each protein type."""
-        print("Optimizing tree parameters for each protein type...")
+    def _build_faiss_index(self, embeddings: np.ndarray) -> faiss.Index:
+        """Build an optimized FAISS index."""
+        dimension = embeddings.shape[1]
         
-        for protein_id in tqdm(self.protein_types):
-            print(f"\nOptimizing parameters for protein {protein_id}")
-            
-            # Load protein data
-            protein_data = self._load_reference_data(protein_id)
-            num_embeddings = len(protein_data['embeddings'])
-            
-            # Calculate theoretical optimal parameters
-            depth, branch = TreeOptimizer.calculate_tree_parameters(num_embeddings)
+        # Use IVFFlat index with inner product distance
+        nlist = min(4096, max(4, int(np.sqrt(len(embeddings)))))  # Number of clusters
+        quantizer = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
+        
+        # Train the index
+        index.train(embeddings)
+        index.add(embeddings)
+        
+        # Set number of probes for search
+        index.nprobe = min(64, nlist)
+        
+        return index
 
-            self.protein_parameters[protein_id] = {
-                'max_depth': depth,
-                'branching_factor': branch
-            }
+    def _process_protein(self, protein_id: str):
+        """Process a single protein type."""
+        try:
+            MemoryTracker.log_memory_usage(f"Before processing protein {protein_id}")
             
-            print(f"Selected parameters for protein {protein_id}:")
-            print(f"  depth={self.protein_parameters[protein_id]['max_depth']}")
-            print(f"  branching_factor={self.protein_parameters[protein_id]['branching_factor']}")
-
-    def generate_multilevel_clusters(self):
-        """Generate multi-level hierarchical clustering for each protein type."""
-        print("Generating multi-level hierarchical clusters...")
-        
-        # Optimize parameters if not already done
-        if not self.protein_parameters:
-            self.optimize_protein_parameters()
-        
-        for protein_id in tqdm(self.protein_types):
+            if protein_id in self.indices:
+                del self.indices[protein_id]
+                gc.collect()
+            
             ref_data = self._load_reference_data(protein_id)
+            index = self._build_faiss_index(ref_data['embeddings'])
             
-            # Build hierarchical tree structure
-            hierarchy = {
-                'embeddings': ref_data['embeddings'],
-                'labels': ref_data['labels'],
-                'children': [],
-                'center': np.mean(ref_data['embeddings'], axis=0)
+            self.indices[protein_id] = {
+                'index': index,
+                'labels': ref_data['labels']
             }
             
-            self._build_hierarchy(hierarchy, depth=0, protein_id=protein_id)
-            self.reference_data[protein_id] = hierarchy
-
-    def _build_hierarchy(self, node, depth, protein_id):
-        """Recursively build hierarchy of clusters using protein-specific parameters."""
-        params = self.protein_parameters[protein_id]
-        
-        if depth >= params['max_depth'] or len(node['embeddings']) <= params['branching_factor']:
-            return
+            logger.info(f"Built FAISS index for protein {protein_id}")
             
-        linkage_matrix = linkage(node['embeddings'], method='ward')
-        cluster_labels = fcluster(linkage_matrix, params['branching_factor'], criterion='maxclust')
+            del ref_data
+            gc.collect()
+            
+            MemoryTracker.log_memory_usage(f"After processing protein {protein_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing protein {protein_id}: {str(e)}")
+
+    def build_indices(self):
+        """Build FAISS indices for each protein type."""
+        logger.info("Building FAISS indices for each protein type...")
         
-        for i in range(1, params['branching_factor'] + 1):
-            mask = cluster_labels == i
-            if not np.any(mask):
-                continue
+        for protein_id in tqdm(self.protein_types):
+            try:
+                MemoryTracker.log_memory_usage(f"Before processing protein {protein_id}")
                 
-            child = {
-                'embeddings': node['embeddings'][mask],
-                'labels': node['labels'][mask],
-                'children': [],
-                'center': np.mean(node['embeddings'][mask], axis=0)
-            }
-            node['children'].append(child)
-            
-            self._build_hierarchy(child, depth + 1, protein_id)
+                # Clear previous protein data
+                if protein_id in self.indices:
+                    del self.indices[protein_id]
+                    gc.collect()
+                
+                # Load data
+                ref_data = self._load_reference_data(protein_id)
+                
+                # Build FAISS index
+                dimension = ref_data['embeddings'].shape[1]
+                index = faiss.IndexFlatL2(dimension)  # L2 distance
+                index.add(ref_data['embeddings'].astype(np.float32))
+                
+                # Store index and labels
+                self.indices[protein_id] = {
+                    'index': index,
+                    'labels': ref_data['labels']
+                }
+                
+                logger.info(f"Built FAISS index for protein {protein_id}")
+                
+                del ref_data
+                gc.collect()
+                
+                MemoryTracker.log_memory_usage(f"After processing protein {protein_id}")
+                
+            except Exception as e:
+                logger.error(f"Error processing protein {protein_id}: {str(e)}")
+                continue
 
-    def predict_binding(self, query_embeddings, protein_id):
-        """Use multi-level hierarchy for efficient prediction."""
-        hierarchy = self.reference_data[protein_id]
-        predictions = []
-        
-        for query in query_embeddings:
-            # Navigate down the hierarchy
-            current_node = hierarchy
-            while current_node['children']:
-                # Find nearest child cluster
-                distances = cdist([query], 
-                                [child['center'] for child in current_node['children']])[0]
-                nearest_idx = np.argmin(distances)
-                current_node = current_node['children'][nearest_idx]
+    def predict_binding(self, query_embeddings: np.ndarray, protein_id: str) -> np.ndarray:
+        """Predict binding using FAISS nearest neighbor search."""
+        if protein_id not in self.indices:
+            raise KeyError(f"No index found for protein {protein_id}. Did you run build_indices()?")
             
-            # At leaf node, find k nearest neighbors
-            distances = cdist([query], current_node['embeddings'])[0]
-            nearest_indices = np.argsort(distances)[:self.k_neighbors]
-            nearest_labels = current_node['labels'][nearest_indices]
-            
-            pred = int(np.mean(nearest_labels) > 0.5)
-            predictions.append(pred)
+        index_data = self.indices[protein_id]
         
-        return np.array(predictions)
+        # Get k nearest neighbors
+        _, neighbors = index_data['index'].search(query_embeddings.astype(np.float32), self.k_neighbors)
+        
+        nearest_labels = index_data['labels'][neighbors]
+        predictions = (nearest_labels.mean(axis=1) > 0.5).astype(np.int8)
+        
+        return predictions
     
     def generate_predictions(self):
-        """Generate and save predictions for all test embeddings."""
-        print("Loading test embeddings...")
-        test_path = os.path.join(self.test_dir, 'test_embeddings.pkl')
-        with open(test_path, 'rb') as f:
+        """Generate predictions with batch processing."""
+        logger.info("Loading test embeddings...")
+        
+        # Define batch size
+        BATCH_SIZE = 10000  # You can adjust this value based on your memory constraints
+        predictions = []
+        
+        # Load test data
+        with open(os.path.join(self.test_dir, 'test_embeddings.pkl'), 'rb') as f:
             test_data = pickle.load(f)
         
-        # Generate clusters if not already generated
-        if not self.reference_data:
-            self.generate_multilevel_clusters()
+        test_data['embeddings'] = test_data['embeddings'].astype(np.float32)
         
-        print("Generating predictions...")
-        all_predictions = []
-        
-        # Group test data by protein type
-        unique_proteins = np.unique(test_data['protein_ids'])
-        for protein_id in tqdm(unique_proteins):
-            # Get embeddings for current protein
-            mask = test_data['protein_ids'] == protein_id
-            protein_embeddings = test_data['embeddings'][mask]
-            molecule_ids = test_data['molecule_ids'][mask]
+        # Process by protein and batch
+        for protein_id in tqdm(self.protein_types):
+            indices = np.where(test_data['protein_ids'] == protein_id)[0]
             
-            # Generate predictions
-            predictions = self.predict_binding(protein_embeddings, protein_id)
-            
-            # Store results
-            for mol_id, pred in zip(molecule_ids, predictions):
-                all_predictions.append({
-                    'id': int(mol_id),
-                    'binds': int(pred)
-                })
+            for i in range(0, len(indices), BATCH_SIZE):
+                if MemoryTracker.get_available_memory() < self.memory_threshold:
+                    gc.collect()
+                
+                batch_indices = indices[i:i + BATCH_SIZE]
+                batch_embeddings = test_data['embeddings'][batch_indices]
+                batch_molecule_ids = test_data['molecule_ids'][batch_indices]
+                
+                batch_predictions = self.predict_binding(batch_embeddings, protein_id)
+                
+                # Create dictionary entries with correct column names
+                for mol_id, pred in zip(batch_molecule_ids, batch_predictions):
+                    predictions.append({
+                        'id': int(mol_id),
+                        'binds': int(pred)
+                    })
+                
+                logger.info(f"Processed batch for protein {protein_id}: "
+                           f"{i+1}-{min(i+BATCH_SIZE, len(indices))} of {len(indices)}")
         
-        # Create and save submission file
+        # Create DataFrame and save
         os.makedirs(self.output_dir, exist_ok=True)
-        submission_df = pd.DataFrame(all_predictions)
-        submission_df = submission_df.sort_values('id')
-        submission_path = os.path.join(self.output_dir, 'submission.csv')
-        submission_df.to_csv(submission_path, index=False)
+        df = pd.DataFrame(predictions)
         
-        print(f"Predictions saved to {submission_path}")
+        if 'id' in df.columns:
+            df.sort_values('id', inplace=True)
+        else:
+            logger.warning("Column 'id' not found in DataFrame. Columns present:", df.columns)
+        
+        output_path = os.path.join(self.output_dir, 'submission.csv')
+        df.to_csv(output_path, index=False, compression='gzip')
+        
+        logger.info(f"Saved predictions for {len(df)} molecules to {output_path}")
+
 
 if __name__ == "__main__":
-    # Create prediction generator
-    generator = PredictionGenerator(
-        reference_dir='reference_embeddings',
-        test_dir='test_embeddings',
-        output_dir='submissions',
-        k_neighbors=5
-    )
-    
-    # Optimize parameters for each protein type
-    generator.optimize_protein_parameters()
-    
-    # Generate predictions using optimized parameters
-    generator.generate_predictions()
+    try:
+        generator = PredictionGenerator(
+            reference_dir='reference_embeddings',
+            test_dir='test_embeddings',
+            output_dir='submissions',
+            k_neighbors=5,
+            memory_threshold=0.8,
+            n_jobs=-1
+        )
+        
+        # Build indices first!
+        generator.build_indices()
+        
+        # Then generate predictions
+        generator.generate_predictions()
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        raise
